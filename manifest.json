@@ -1,0 +1,19 @@
+{
+  "manifest_version": 3,
+  "name": "Webhole",
+  "version": "0.1.0",
+  "description": "Switch Chrome proxy modes for a local SOCKS5 tunnel.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA44Xkb9nxo2qRxddB2eA40AKEipWCOCa9/Yu1MrYLUWkmaRQ4g616rFGvDOB6fNxX7LfKDXiYruyqXOQIEbnmF/EOaaPDA3HLJqhpvTxBKEqxF6a75OcCa/XJII8NGgs3yG0UhC4i6OdSeqHS41KdkJve4+LI7jgt/vFSWuapA/G3u5O+8XaWjism7qawIPvSdp3B/MV3vC9oMdWc5iTTOYsbEh2LIkcrRmOrU8g+QnMd65VYkLhzbNB4k+kigJTzAyqD616Ypvn/wogCA20paPGBznWPybpN+kQdHO2twqnkZxFoUaE/Sb9G16hWgp3VyxXUoYDs+zmwO3AtatI9ZwIDAQAB",
+  "permissions": [
+    "nativeMessaging",
+    "proxy",
+    "storage"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "Webhole",
+    "default_popup": "popup.html"
+  }
+}

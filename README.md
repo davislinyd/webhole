@@ -59,5 +59,5 @@ sh scripts/install-native-host-macos.sh chrome-dev
 Then load the unpacked extension from:
 
 ```text
-/Users/lindav/git/webhole
+<project-root>
 ```

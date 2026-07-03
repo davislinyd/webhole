@@ -14,6 +14,8 @@ const helpSection = document.getElementById("helpSection");
 const logToggle = document.getElementById("logToggle");
 const logSection = document.getElementById("logSection");
 const logList = document.getElementById("logList");
+const logSummaryText = document.getElementById("logSummaryText");
+const logSummaryMeta = document.getElementById("logSummaryMeta");
 const clearLogButton = document.getElementById("clearLogButton");
 const statusEl = document.getElementById("status");
 
@@ -59,9 +61,15 @@ function renderLogs(logs) {
   const entries = Array.isArray(logs) ? logs.slice(-LOG_LIMIT).reverse() : [];
 
   if (entries.length === 0) {
+    logSummaryText.textContent = "No logs yet.";
+    logSummaryMeta.textContent = "";
     logList.innerHTML = '<div class="hint">No logs yet.</div>';
     return;
   }
+
+  const latest = entries[0];
+  logSummaryText.textContent = latest.message || "Log entry";
+  logSummaryMeta.textContent = formatLogTime(latest.time || Date.now());
 
   logList.replaceChildren(
     ...entries.map((entry) => {
@@ -193,6 +201,25 @@ function setBusy(isBusy) {
   disconnectButton.disabled = isBusy;
 }
 
+function setConnectButtonState(state) {
+  connectButton.classList.remove("is-connected", "is-disconnected", "is-pending");
+
+  if (state === "connected") {
+    connectButton.classList.add("is-connected");
+    connectButton.textContent = "On";
+    return;
+  }
+
+  if (state === "starting") {
+    connectButton.classList.add("is-pending");
+    connectButton.textContent = "On";
+    return;
+  }
+
+  connectButton.classList.add("is-disconnected");
+  connectButton.textContent = "On";
+}
+
 function formatTunnelStatus(response) {
   if (!response.ok) {
     return response.message || "Tunnel error";
@@ -212,9 +239,11 @@ function formatTunnelStatus(response) {
 async function refreshTunnelStatus() {
   try {
     const response = await sendTunnelMessage("status");
+    setConnectButtonState(response.state);
     setStatus(formatTunnelStatus(response), !response.ok);
     appendLog(`Status: ${formatTunnelStatus(response)}`);
   } catch (error) {
+    setConnectButtonState("error");
     setStatus(error.message, true);
     appendLog(`Status failed: ${error.message}`);
   }
@@ -230,6 +259,7 @@ async function connectTunnel() {
 
   setBusy(true);
   setStatus("Connecting...");
+  setConnectButtonState("starting");
   appendLog(`Connect requested: ${hostAlias}`);
 
   if (getSelectedMode() === DEFAULT_MODE) {
@@ -240,9 +270,11 @@ async function connectTunnel() {
     saveSettings(false);
 
     const response = await sendTunnelMessage("connect");
+    setConnectButtonState(response.state);
     setStatus(formatTunnelStatus(response), !response.ok);
     appendLog(`Connect result: ${formatTunnelStatus(response)}`);
   } catch (error) {
+    setConnectButtonState("error");
     setStatus(error.message, true);
     appendLog(`Connect failed: ${error.message}`);
   } finally {
@@ -253,15 +285,18 @@ async function connectTunnel() {
 async function disconnectTunnel() {
   setBusy(true);
   setStatus("Disconnecting...");
+  setConnectButtonState("starting");
   appendLog("Disconnect requested");
 
   try {
     const response = await sendTunnelMessage("disconnect");
 
     setSelectedMode(DEFAULT_MODE);
+    setConnectButtonState(response.state);
     setStatus(formatTunnelStatus(response), !response.ok);
     appendLog(`Disconnect result: ${formatTunnelStatus(response)}`);
   } catch (error) {
+    setConnectButtonState("error");
     setStatus(error.message, true);
     appendLog(`Disconnect failed: ${error.message}`);
   } finally {
@@ -281,6 +316,7 @@ chrome.storage.local.get(
     const domains = Array.isArray(items.domains) ? items.domains : [];
 
     setSelectedMode(mode);
+    setConnectButtonState("disconnected");
     hostAliasInput.value = normalizeHostAlias(String(items.hostAlias || ""));
     domainsInput.value = normalizeDomains(domains.join("\n")).join("\n");
     renderLogs(items.logs);

@@ -4,6 +4,20 @@ const NATIVE_HOST = "com.webhole.host";
 const PROXY_HOST = "127.0.0.1";
 const PROXY_PORT = 1080;
 const VALID_MODES = new Set(["direct", "global", "auto"]);
+const ICONS = {
+  connected: {
+    16: "icons/connected/icon-16.png",
+    32: "icons/connected/icon-32.png",
+    48: "icons/connected/icon-48.png",
+    128: "icons/connected/icon-128.png"
+  },
+  disconnected: {
+    16: "icons/disconnected/icon-16.png",
+    32: "icons/disconnected/icon-32.png",
+    48: "icons/disconnected/icon-48.png",
+    128: "icons/disconnected/icon-128.png"
+  }
+};
 
 function normalizeMode(mode) {
   return VALID_MODES.has(mode) ? mode : DEFAULT_MODE;
@@ -38,6 +52,12 @@ function appendLog(message) {
         resolve
       );
     });
+  });
+}
+
+function setActionIcon(isConnected) {
+  chrome.action.setIcon({
+    path: isConnected ? ICONS.connected : ICONS.disconnected
   });
 }
 
@@ -230,10 +250,12 @@ async function syncTunnelAndProxy() {
   const response = await sendNativeMessage({ action: "status" });
 
   if (response.ok && response.state === "connected") {
+    setActionIcon(true);
     applyStoredProxy();
     return response;
   }
 
+  setActionIcon(false);
   clearProxy();
   return response;
 }
@@ -256,12 +278,15 @@ async function handleTunnelMessage(message) {
     });
 
     if (response.ok && (response.state === "connected" || response.state === "starting")) {
+      setActionIcon(response.state === "connected");
       await saveSettings({
         mode,
         domains,
         hostAlias
       });
       applyProxy(mode, domains);
+    } else {
+      setActionIcon(false);
     }
 
     return response;
@@ -271,6 +296,7 @@ async function handleTunnelMessage(message) {
     appendLog("Background disconnect");
     const response = await sendNativeMessage({ action: "disconnect" });
 
+    setActionIcon(false);
     await setDirectMode();
 
     return response;

@@ -99,7 +99,7 @@
       .modes {
         display: grid;
         grid-template-columns: repeat(3, minmax(0, 1fr));
-        gap: 6px;
+        gap: 5px;
       }
 
       .tunnel {
@@ -118,13 +118,15 @@
         display: flex;
         justify-content: center;
         align-items: center;
-        min-height: 34px;
-        padding: 8px 6px;
+        min-height: 30px;
+        padding: 6px 4px;
         border: 1px solid var(--line);
-        border-radius: 8px;
+        border-radius: 6px;
         background: var(--surface);
         cursor: pointer;
         text-align: center;
+        font-size: 11px;
+        line-height: 1.15;
       }
 
       label.mode:has(input:checked) {
@@ -168,14 +170,31 @@
         cursor: pointer;
       }
 
-      .primary {
-        border-color: var(--accent);
-        background: var(--accent);
+      .connect-button {
+        min-width: 62px;
+        transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease;
+      }
+
+      .connect-button.is-disconnected {
+        border-color: var(--line);
+        background: var(--surface-soft);
+        color: var(--muted);
+      }
+
+      .connect-button.is-pending {
+        border-color: #f0b429;
+        background: #fff4d6;
+        color: #8a5b00;
+      }
+
+      .connect-button.is-connected {
+        border-color: #16a34a;
+        background: #16a34a;
         color: #ffffff;
       }
 
-      .primary:hover:not(:disabled),
-      .primary:focus-visible {
+      .connect-button:hover:not(:disabled),
+      .connect-button:focus-visible {
         color: #ffffff;
       }
 
@@ -248,13 +267,11 @@
         color: var(--danger);
       }
 
-      .help,
-      .logs {
+      .help {
         display: none;
       }
 
-      .help.is-open,
-      .logs.is-open {
+      .help.is-open {
         display: block;
       }
 
@@ -282,12 +299,42 @@
         gap: 12px;
       }
 
-      .log-list {
-        max-height: 116px;
-        overflow: auto;
+      .log-summary {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        min-width: 0;
+      }
+
+      .log-summary-text {
+        min-width: 0;
+        flex: 1;
+        overflow: hidden;
+        white-space: nowrap;
+        text-overflow: ellipsis;
+        color: var(--text);
+      }
+
+      .log-summary-meta {
+        flex: none;
+        color: var(--muted);
+        font-size: 11px;
+      }
+
+      .logs {
+        padding-bottom: 8px;
+      }
+
+      .log-details {
+        display: none;
         margin-top: 8px;
-        display: grid;
+        max-height: 108px;
+        overflow: auto;
         gap: 6px;
+      }
+
+      .logs.is-open .log-details {
+        display: grid;
       }
 
       .log-item {
@@ -333,17 +380,23 @@
 
     <section class="section logs" id="logSection">
       <div class="utility-row">
-        <strong>Log</strong>
-        <button class="link-button" id="clearLogButton" type="button">Clear</button>
+        <div class="log-summary">
+          <strong>Log</strong>
+          <span class="log-summary-text" id="logSummaryText">No logs yet.</span>
+          <span class="log-summary-meta" id="logSummaryMeta"></span>
+        </div>
+        <div class="header-actions">
+          <button class="link-button" id="clearLogButton" type="button">Clear</button>
+        </div>
       </div>
-      <div class="log-list" id="logList"></div>
+      <div class="log-details" id="logList"></div>
     </section>
 
     <section class="section tunnel">
       <label for="hostAliasInput">SSH Host</label>
       <div class="tunnel-row">
         <input id="hostAliasInput" type="text" spellcheck="false" autocomplete="off" placeholder="my-host">
-        <button id="connectButton" class="primary" type="button">On</button>
+        <button id="connectButton" class="connect-button is-disconnected" type="button">On</button>
         <button id="disconnectButton" type="button">Off</button>
       </div>
     </section>

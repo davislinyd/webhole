@@ -242,6 +242,10 @@ function formatLogTime(value) {
 }
 
 function renderLogs(logs) {
+  if (!logSummaryText || !logSummaryMeta || !logList) {
+    return;
+  }
+
   const entries = Array.isArray(logs) ? logs.slice(-LOG_LIMIT).reverse() : [];
 
   if (entries.length === 0) {
@@ -271,6 +275,42 @@ function renderLogs(logs) {
       return item;
     })
   );
+}
+
+function setPanelOpen(section, toggle, open) {
+  if (!section) {
+    return;
+  }
+
+  section.classList.toggle("is-open", open);
+
+  if (toggle) {
+    toggle.classList.toggle("is-active", open);
+    toggle.setAttribute("aria-expanded", open ? "true" : "false");
+  }
+
+  if (open) {
+    // Chrome action popup is short; bring panel into view after layout.
+    requestAnimationFrame(() => {
+      try {
+        section.scrollIntoView({ block: "nearest", behavior: "smooth" });
+      } catch (_error) {
+        section.scrollIntoView();
+      }
+    });
+  }
+}
+
+function toggleHelpPanel() {
+  const willOpen = !helpSection?.classList.contains("is-open");
+  setPanelOpen(logSection, logToggle, false);
+  setPanelOpen(helpSection, helpToggle, willOpen);
+}
+
+function toggleLogPanel() {
+  const willOpen = !logSection?.classList.contains("is-open");
+  setPanelOpen(helpSection, helpToggle, false);
+  setPanelOpen(logSection, logToggle, willOpen);
 }
 
 function appendLog(message) {
@@ -882,14 +922,17 @@ async function refreshDnsStatus() {
       const parts = [];
       parts.push(enforce.enforce ? "Enforce ON" : "Enforce OFF");
       parts.push(enforce.dnsState === "running" ? `stub:${enforce.dns?.port}` : "stub:off");
-      parts.push(enforce.dns?.resolverInstalled ? "resolver:ok" : "resolver:?");
+      const resolverOk = Boolean(enforce.resolverInstalled || enforce.dns?.resolverInstalled);
+      parts.push(resolverOk ? "resolver:ok" : "resolver:missing");
       const doh = enforce.secureDns?.value;
       parts.push(doh === "off" ? "DoH:off" : `DoH:${doh || "?"}`);
       parts.push(enforce.gateway?.port ? `gw:${enforce.gateway.port}` : "gw:off");
       const warn =
         enforce.enforce &&
-        enforce.dnsState === "running" &&
-        (doh && doh !== "off" || enforce.secureDns && !enforce.secureDns.ok);
+        (enforce.dnsState !== "running" ||
+          !resolverOk ||
+          (doh && doh !== "off") ||
+          (enforce.secureDns && enforce.secureDns.ok === false));
       setDnsEnforceStatus(parts.join(" · "), Boolean(warn));
     }
   } catch (error) {
@@ -996,17 +1039,63 @@ async function queryDnsTest() {
 }
 
 async function installDnsResolver() {
+  const settings = collectDnsSettingsFromUi();
+  const complete = settings.dnsRules.filter(
+    (rule) =>
+      rule.enabled &&
+      rule.domain &&
+      DOMAIN_PATTERN_RE.test(rule.domain) &&
+      isValidIpv4(rule.nameserver) &&
+      (rule.kind !== "via_ssh" || isValidHostAlias(rule.hostAlias))
+  );
+
+  if (!complete.length) {
+    setDnsStatus("Reinstall 需要至少一條已啟用的完整 DNS 規則", true);
+    return;
+  }
+
   setDnsStatus("Installing macOS resolver stubs (admin prompt)…");
-  const response = await sendDnsMessage("dnsInstallResolver");
-  setDnsStatus(response?.message || "Install finished", !response?.ok);
-  appendLog(`DNS resolver install: ${response?.message || response?.state}`);
+  setDnsEnforceStatus("Reinstall resolver…");
+
+  try {
+    // Persist current rules first so background/native see the same config.
+    await new Promise((resolve) => {
+      chrome.storage.local.set(settings, resolve);
+    });
+
+    const response = await sendDnsMessage("dnsInstallResolver", {
+      ensureDnsRunning: true
+    });
+    setDnsStatus(response?.message || "Install finished", !response?.ok);
+    setDnsEnforceStatus(
+      response?.ok
+        ? `resolver reinstalled${response.stubRunning === false ? " · stub not running — press DNS On" : ""}`
+        : response?.message || "reinstall failed",
+      !response?.ok || response?.stubRunning === false
+    );
+    appendLog(`DNS resolver install: ${response?.message || response?.state}`);
+    await refreshDnsStatus();
+  } catch (error) {
+    setDnsStatus(error.message, true);
+  }
 }
 
 async function uninstallDnsResolver() {
   setDnsStatus("Uninstalling macOS resolver stubs…");
-  const response = await sendDnsMessage("dnsUninstallResolver");
-  setDnsStatus(response?.message || "Uninstall finished", !response?.ok);
-  appendLog(`DNS resolver uninstall: ${response?.message || response?.state}`);
+  setDnsEnforceStatus("Uninstall resolver…");
+
+  try {
+    const response = await sendDnsMessage("dnsUninstallResolver");
+    setDnsStatus(response?.message || "Uninstall finished", !response?.ok);
+    setDnsEnforceStatus(
+      response?.ok ? "resolver uninstalled (corp/system DNS may take over)" : response?.message || "uninstall failed",
+      !response?.ok
+    );
+    appendLog(`DNS resolver uninstall: ${response?.message || response?.state}`);
+    await refreshDnsStatus();
+  } catch (error) {
+    setDnsStatus(error.message, true);
+  }
 }
 
 function collectSettingsFromUi() {
@@ -1641,13 +1730,23 @@ dnsDefaultNameserverInput?.addEventListener("change", () => saveDnsSettings());
 dnsDefaultNameserverPortInput?.addEventListener("change", () => saveDnsSettings());
 dnsEnforceInput?.addEventListener("change", () => saveDnsSettings());
 
-helpToggle?.addEventListener("click", () => {
-  helpSection?.classList.toggle("is-open");
+helpToggle?.addEventListener("click", (event) => {
+  event.preventDefault();
+  event.stopPropagation();
+  toggleHelpPanel();
 });
 
-logToggle?.addEventListener("click", () => {
-  logSection?.classList.toggle("is-open");
+logToggle?.addEventListener("click", (event) => {
+  event.preventDefault();
+  event.stopPropagation();
+  toggleLogPanel();
 });
+
+// Keyboard-friendly toggles
+helpToggle?.setAttribute("aria-controls", "helpSection");
+helpToggle?.setAttribute("aria-expanded", "false");
+logToggle?.setAttribute("aria-controls", "logSection");
+logToggle?.setAttribute("aria-expanded", "false");
 
 clearLogButton?.addEventListener("click", () => {
   chrome.storage.local.set({ logs: [] }, () => {

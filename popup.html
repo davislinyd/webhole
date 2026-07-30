@@ -72,6 +72,12 @@
         padding-top: 2px;
       }
 
+      .header-actions .link-button.is-active {
+        color: var(--accent);
+        font-weight: 700;
+        text-decoration: underline;
+      }
+
       /* —— Panels —— */
       .panel {
         padding: 12px;
@@ -592,6 +598,10 @@
       .help.is-open,
       .logs.is-open {
         display: block;
+        max-height: 220px;
+        overflow: auto;
+        border-color: var(--accent);
+        box-shadow: 0 0 0 1px var(--accent-soft);
       }
 
       .help ol {

@@ -1460,6 +1460,21 @@ async function dnsStatus() {
     }
   }
 
+  const onDisk = listManagedResolverFilesOnDisk();
+  const resolverInstalled =
+    onDisk.length > 0 || Boolean(dns.resolverInstalled && readResolverManifest().length);
+
+  // Heal stale flag after manual uninstall/reinstall cycles.
+  if (resolverInstalled !== Boolean(dns.resolverInstalled)) {
+    writeState({
+      dns: {
+        ...dns,
+        resolverInstalled,
+        gateway: dns.gateway || null
+      }
+    });
+  }
+
   return {
     ok: true,
     state: "running",
@@ -1469,7 +1484,8 @@ async function dnsStatus() {
       startedAt: dns.startedAt,
       forwards: forwardReports,
       enforce: dns.enforce !== false,
-      resolverInstalled: Boolean(dns.resolverInstalled),
+      resolverInstalled,
+      resolverFiles: onDisk,
       gateway
     }
   };
@@ -1876,6 +1892,109 @@ function writeResolverManifest(files) {
   fs.writeFileSync(DNS_RESOLVER_MANIFEST, JSON.stringify({ files }, null, 2));
 }
 
+/** Discover Webhole-managed stubs even if manifest was lost after uninstall/reinstall. */
+function listManagedResolverFilesOnDisk() {
+  try {
+    if (!fs.existsSync(RESOLVER_DIR)) {
+      return [];
+    }
+
+    const names = fs.readdirSync(RESOLVER_DIR);
+    const files = [];
+
+    for (const name of names) {
+      if (!name || name.startsWith(".")) {
+        continue;
+      }
+
+      const full = path.join(RESOLVER_DIR, name);
+
+      try {
+        const stat = fs.statSync(full);
+
+        if (!stat.isFile()) {
+          continue;
+        }
+
+        const text = fs.readFileSync(full, "utf8");
+
+        if (text.includes("Managed by Webhole")) {
+          files.push(full);
+        }
+      } catch (_error) {
+        // ignore unreadable entry
+      }
+    }
+
+    return files;
+  } catch (_error) {
+    return [];
+  }
+}
+
+function mergeResolverFileLists(...lists) {
+  const seen = new Set();
+  const result = [];
+
+  for (const list of lists) {
+    for (const file of list || []) {
+      const value = String(file || "");
+
+      if (!value || seen.has(value)) {
+        continue;
+      }
+
+      if (!value.startsWith(`${RESOLVER_DIR}/`) || value.includes("..")) {
+        continue;
+      }
+
+      seen.add(value);
+      result.push(value);
+    }
+  }
+
+  return result;
+}
+
+function verifyResolverFiles(files, port) {
+  const missing = [];
+  const wrong = [];
+
+  for (const file of files) {
+    try {
+      const text = fs.readFileSync(file, "utf8");
+
+      if (!text.includes("Managed by Webhole") || !text.includes("127.0.0.1")) {
+        wrong.push(file);
+        continue;
+      }
+
+      if (!text.includes(`port ${port}`)) {
+        wrong.push(file);
+      }
+    } catch (_error) {
+      missing.push(file);
+    }
+  }
+
+  return { missing, wrong, ok: missing.length === 0 && wrong.length === 0 };
+}
+
+function setDnsResolverInstalledFlag(installed) {
+  const state = readState();
+
+  if (!state.dns) {
+    return;
+  }
+
+  writeState({
+    dns: {
+      ...state.dns,
+      resolverInstalled: Boolean(installed)
+    }
+  });
+}
+
 async function runOsascriptAdmin(shellScript) {
   return new Promise((resolve) => {
     const apple = `do shell script ${JSON.stringify(shellScript)} with administrator privileges`;
@@ -1917,11 +2036,11 @@ async function dnsInstallResolver(message) {
     return {
       ok: false,
       state: "error",
-      message: "No enabled DNS rules to install resolver stubs for."
+      message: "No enabled DNS rules to install resolver stubs for. Add/enable a rule first."
     };
   }
 
-  const previous = readResolverManifest();
+  const previous = mergeResolverFileLists(readResolverManifest(), listManagedResolverFilesOnDisk());
   const nextFiles = domains
     .filter((domain) => DOMAIN_RE.test(domain) && !domain.includes("/"))
     .map((domain) => `${RESOLVER_DIR}/${domain}`);
@@ -1929,7 +2048,7 @@ async function dnsInstallResolver(message) {
 
   // Remove stale Webhole-managed stubs no longer in the rule set.
   for (const file of previous) {
-    if (file.startsWith(`${RESOLVER_DIR}/`) && !nextFiles.includes(file) && !file.includes("..")) {
+    if (!nextFiles.includes(file)) {
       lines.push(`rm -f ${JSON.stringify(file)}`);
     }
   }
@@ -1942,15 +2061,22 @@ async function dnsInstallResolver(message) {
     const content = `# Managed by Webhole\nnameserver 127.0.0.1\nport ${port}\n`;
     const filePath = `${RESOLVER_DIR}/${domain}`;
     const b64 = Buffer.from(content, "utf8").toString("base64");
-    lines.push(`echo ${b64} | base64 -d > ${JSON.stringify(filePath)}`);
+    // macOS base64 accepts -D / -d; write via python for reliability.
+    lines.push(
+      `python3 -c ${JSON.stringify(
+        `import pathlib; pathlib.Path(${JSON.stringify(filePath)}).write_text(${JSON.stringify(content)})`
+      )}`
+    );
   }
 
   lines.push("dscacheutil -flushcache >/dev/null 2>&1 || true");
   lines.push("killall -HUP mDNSResponder >/dev/null 2>&1 || true");
+  lines.push("sleep 0.3");
   lines.push("true");
   const result = await runOsascriptAdmin(lines.join(" && "));
 
   if (!result.ok) {
+    setDnsResolverInstalledFlag(false);
     return {
       ok: false,
       state: "error",
@@ -1958,14 +2084,38 @@ async function dnsInstallResolver(message) {
     };
   }
 
+  // Give mDNSResponder a moment, then verify files on disk.
+  await wait(400);
+  const verification = verifyResolverFiles(nextFiles, port);
+
+  if (!verification.ok) {
+    setDnsResolverInstalledFlag(false);
+    appendDnsLog(
+      `resolver verify failed missing=${verification.missing.join(",")} wrong=${verification.wrong.join(",")}`
+    );
+    return {
+      ok: false,
+      state: "error",
+      message: `Resolver write reported ok but files invalid (missing=${verification.missing.length}, wrong=${verification.wrong.length}). Try Reinstall again.`
+    };
+  }
+
   writeResolverManifest(nextFiles);
+  setDnsResolverInstalledFlag(true);
   appendDnsLog(`installed resolver stubs for ${domains.join(", ")} port=${port}`);
+
+  const dns = readState().dns;
+  const stubUp = Boolean(dns?.pid && isProcessAlive(dns.pid));
 
   return {
     ok: true,
     state: "installed",
-    message: `Installed ${nextFiles.length} resolver stub(s) → 127.0.0.1:${port}`,
-    files: nextFiles
+    message: stubUp
+      ? `Installed ${nextFiles.length} resolver stub(s) → 127.0.0.1:${port}`
+      : `Installed ${nextFiles.length} stub(s) → 127.0.0.1:${port}, but DNS stub is not running — press DNS On`,
+    files: nextFiles,
+    stubRunning: stubUp,
+    warning: stubUp ? "" : "DNS stub not running"
   };
 }
 
@@ -1978,13 +2128,15 @@ async function dnsUninstallResolver() {
     };
   }
 
-  const files = readResolverManifest();
+  const files = mergeResolverFileLists(readResolverManifest(), listManagedResolverFilesOnDisk());
 
   if (!files.length) {
+    writeResolverManifest([]);
+    setDnsResolverInstalledFlag(false);
     return {
       ok: true,
       state: "absent",
-      message: "No Webhole resolver stubs recorded."
+      message: "No Webhole resolver stubs found on disk."
     };
   }
 
@@ -1993,6 +2145,8 @@ async function dnsUninstallResolver() {
   );
 
   if (!safeFiles.length) {
+    writeResolverManifest([]);
+    setDnsResolverInstalledFlag(false);
     return { ok: true, state: "absent", message: "No safe resolver files to remove." };
   }
 
@@ -2000,6 +2154,7 @@ async function dnsUninstallResolver() {
     ...safeFiles.map((file) => `rm -f ${JSON.stringify(file)}`),
     "dscacheutil -flushcache >/dev/null 2>&1 || true",
     "killall -HUP mDNSResponder >/dev/null 2>&1 || true",
+    "sleep 0.2",
     "true"
   ].join(" && ");
   const result = await runOsascriptAdmin(script);
@@ -2013,13 +2168,21 @@ async function dnsUninstallResolver() {
   }
 
   writeResolverManifest([]);
+  setDnsResolverInstalledFlag(false);
   appendDnsLog(`uninstalled resolver stubs: ${safeFiles.join(", ")}`);
 
+  // Confirm removal.
+  const leftovers = listManagedResolverFilesOnDisk();
+
   return {
-    ok: true,
-    state: "uninstalled",
-    message: `Removed ${safeFiles.length} resolver stub(s).`,
-    files: safeFiles
+    ok: leftovers.length === 0,
+    state: leftovers.length === 0 ? "uninstalled" : "partial",
+    message:
+      leftovers.length === 0
+        ? `Removed ${safeFiles.length} resolver stub(s).`
+        : `Removed some stubs; still left: ${leftovers.join(", ")}`,
+    files: safeFiles,
+    leftovers
   };
 }
 

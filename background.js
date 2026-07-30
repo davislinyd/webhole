@@ -1462,13 +1462,22 @@ async function handleDnsMessage(message) {
   if (message.action === "dnsEnforceStatus") {
     const dnsStatus = await sendNativeMessage({ action: "dnsStatus" });
     const secureDns = await getSecureDnsMode();
+    // Prefer live flag from native state; fall back to settings preference.
+    const resolverInstalled =
+      dnsStatus?.dns?.resolverInstalled != null
+        ? Boolean(dnsStatus.dns.resolverInstalled)
+        : Boolean(next.dnsInstallResolverStubs);
+
     return {
       ok: true,
       enforce: next.dnsEnforce !== false,
-      dns: dnsStatus?.dns || null,
+      dns: dnsStatus?.dns
+        ? { ...dnsStatus.dns, resolverInstalled }
+        : null,
       dnsState: dnsStatus?.state || "stopped",
       secureDns,
-      gateway: dnsStatus?.dns?.gateway || null
+      gateway: dnsStatus?.dns?.gateway || null,
+      resolverInstalled
     };
   }
 
@@ -1482,7 +1491,48 @@ async function handleDnsMessage(message) {
 
   if (message.action === "dnsInstallResolver") {
     const payload = buildDnsNativePayload(next);
-    await saveSettings({ dnsInstallResolverStubs: true });
+    await saveSettings({
+      dnsInstallResolverStubs: true,
+      dnsRules: next.dnsRules,
+      dnsListenPort: next.dnsListenPort,
+      dnsDefaultNameserver: next.dnsDefaultNameserver,
+      dnsDefaultNameserverPort: next.dnsDefaultNameserverPort
+    });
+
+    if (!payload.rules.length) {
+      return {
+        ok: false,
+        state: "error",
+        message: "No enabled complete DNS rules to install."
+      };
+    }
+
+    // Reinstall after uninstall is useless if stub is down (macOS falls back to corp DNS).
+    if (message.ensureDnsRunning !== false) {
+      const status = await sendNativeMessage({ action: "dnsStatus" });
+
+      if (status?.state !== "running") {
+        appendLog("Reinstall resolver: starting DNS stub first (no nested auto-install)");
+        const started = await sendNativeMessage({
+          action: "dnsStart",
+          ...payload,
+          autoInstallResolver: false,
+          enforce: payload.enforce
+        });
+
+        if (!started?.ok) {
+          return {
+            ok: false,
+            state: "error",
+            message: started?.message || "DNS stub failed to start; press DNS On then Reinstall.",
+            stubRunning: false
+          };
+        }
+
+        await saveSettings({ dnsEnabled: true, sessionDesiredDns: true });
+      }
+    }
+
     return sendNativeMessage({
       action: "dnsInstallResolver",
       ...payload

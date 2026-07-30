@@ -1442,7 +1442,8 @@ async function dnsStart(message) {
   }
 
   const enforce = message?.enforce !== false;
-  const autoInstallResolver = message?.autoInstallResolver !== false && enforce;
+  // Explicit opt-in only (Chrome gateway does not need /etc/resolver).
+  const autoInstallResolver = message?.autoInstallResolver === true && enforce;
   const config = normalized.config;
   const state = readState();
   const existingDns = state.dns;
@@ -2241,22 +2242,164 @@ function runExecFile(command, args, options = {}) {
   });
 }
 
+function pamTidEnabled() {
+  try {
+    const local = "/etc/pam.d/sudo_local";
+    const sudoPam = "/etc/pam.d/sudo";
+
+    if (fs.existsSync(local)) {
+      const text = fs.readFileSync(local, "utf8");
+
+      if (/^\s*auth\s+.*pam_tid\.so/m.test(text) && !/^\s*#\s*auth\s+.*pam_tid\.so/m.test(text)) {
+        // Ensure the auth line is not commented — check each line.
+        for (const line of text.split("\n")) {
+          const trimmed = line.trim();
+
+          if (trimmed.startsWith("#")) {
+            continue;
+          }
+
+          if (trimmed.includes("pam_tid.so") && trimmed.startsWith("auth")) {
+            return true;
+          }
+        }
+      }
+    }
+
+    if (fs.existsSync(sudoPam)) {
+      for (const line of fs.readFileSync(sudoPam, "utf8").split("\n")) {
+        const trimmed = line.trim();
+
+        if (!trimmed.startsWith("#") && trimmed.includes("pam_tid.so") && trimmed.startsWith("auth")) {
+          return true;
+        }
+      }
+    }
+  } catch (_error) {
+    // ignore
+  }
+
+  return false;
+}
+
+/**
+ * Elevate via Terminal + sudo so pam_tid can show Touch ID (works for unsigned hosts).
+ * Requires scripts/enable-touchid-sudo-macos.sh once.
+ */
+async function runPrivilegedShellViaTerminalSudo(shellScript) {
+  ensureRuntimeDir();
+  const id = `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+  const jobPath = path.join(RUNTIME_DIR, `elevate-${id}.sh`);
+  const donePath = path.join(RUNTIME_DIR, `elevate-${id}.done`);
+  const logPath = path.join(RUNTIME_DIR, `elevate-${id}.log`);
+
+  try {
+    fs.unlinkSync(donePath);
+  } catch (_error) {
+    // ignore
+  }
+
+  const jobBody = [
+    "#!/bin/bash",
+    "set -euo pipefail",
+    shellScript,
+    `echo 0 > ${JSON.stringify(donePath)}`,
+    ""
+  ].join("\n");
+
+  fs.writeFileSync(jobPath, jobBody, { mode: 0o700 });
+
+  // Terminal window: sudo prompts Touch ID when pam_tid is enabled.
+  const terminalCmd = [
+    `clear`,
+    `echo "Webhole: 請用 Touch ID 或密碼授權（sudo）…"`,
+    `sudo /bin/bash ${JSON.stringify(jobPath)} > ${JSON.stringify(logPath)} 2>&1`,
+    `ec=$?`,
+    `echo $ec > ${JSON.stringify(donePath)}`,
+    `if [ $ec -eq 0 ]; then echo "完成，可關閉此視窗。"; sleep 2; exit; else echo "失敗 (exit $ec)，請查看 log。"; fi`
+  ].join("; ");
+
+  const apple = [
+    'tell application "Terminal"',
+    "activate",
+    `do script ${JSON.stringify(terminalCmd)}`,
+    "end tell"
+  ].join("\n");
+
+  const launched = await runExecFile("osascript", ["-e", apple], { timeout: 15000 });
+
+  if (!launched.ok) {
+    try {
+      fs.unlinkSync(jobPath);
+    } catch (_error) {
+      // ignore
+    }
+
+    return {
+      ok: false,
+      message: launched.message || "Failed to open Terminal for Touch ID sudo."
+    };
+  }
+
+  appendDnsLog("privileged shell: waiting for Terminal sudo (Touch ID)");
+  const deadline = Date.now() + 180000;
+
+  while (Date.now() < deadline) {
+    try {
+      if (fs.existsSync(donePath)) {
+        const code = Number(String(fs.readFileSync(donePath, "utf8")).trim());
+        let logText = "";
+
+        try {
+          logText = fs.readFileSync(logPath, "utf8");
+        } catch (_error) {
+          // ignore
+        }
+
+        try {
+          fs.unlinkSync(jobPath);
+          fs.unlinkSync(donePath);
+          fs.unlinkSync(logPath);
+        } catch (_error) {
+          // ignore
+        }
+
+        if (code === 0) {
+          return { ok: true, stdout: logText, method: "terminal-sudo-tid" };
+        }
+
+        return {
+          ok: false,
+          method: "terminal-sudo-tid",
+          message: logText.trim() || `Terminal sudo failed (exit ${code}).`
+        };
+      }
+    } catch (_error) {
+      // ignore read races
+    }
+
+    await wait(300);
+  }
+
+  return {
+    ok: false,
+    method: "terminal-sudo-tid",
+    message: "Timed out waiting for Terminal sudo / Touch ID."
+  };
+}
+
 /**
  * Run a shell script with elevation.
  *
  * Order:
- * 1) sudo -n (cached / passwordless) — no UI
- * 2) osascript "with administrator privileges" — system dialog; on MacBook with
- *    Touch ID enrolled this dialog usually offers Touch ID + password
- *
- * True "prefer Touch ID for sudo in Terminal" is enabled separately via
- * scripts/enable-touchid-sudo-macos.sh (pam_tid). That helps interactive sudo;
- * the Security Agent dialog for (2) already supports Touch ID when the OS allows it.
+ * 1) sudo -n (cached)
+ * 2) Terminal + sudo when pam_tid enabled → real Touch ID
+ * 3) osascript admin dialog (often password-only when launched from Chrome native host)
  */
 async function runPrivilegedShell(shellScript, options = {}) {
   const prompt =
     options.prompt ||
-    "Webhole 需要管理員權限以更新 DNS resolver。\n請使用 Touch ID（指紋）或密碼。";
+    "Webhole 需要管理員權限以更新 DNS resolver。";
 
   // 1) Non-interactive sudo if credentials are already cached / NOPASSWD.
   const sudoN = await runExecFile("sudo", ["-n", "/bin/bash", "-c", shellScript], {
@@ -2268,18 +2411,34 @@ async function runPrivilegedShell(shellScript, options = {}) {
     return { ok: true, stdout: sudoN.stdout, method: "sudo-n" };
   }
 
-  // 2) Bring UI session forward so the Security Agent is more likely to offer Touch ID.
+  // 2) Prefer Terminal + sudo so pam_tid can show Touch ID (Chrome's osascript path often cannot).
+  if (pamTidEnabled()) {
+    const viaTerm = await runPrivilegedShellViaTerminalSudo(shellScript);
+
+    if (viaTerm.ok) {
+      appendDnsLog("privileged shell via Terminal sudo + Touch ID");
+      return viaTerm;
+    }
+
+    appendDnsLog(`Terminal sudo failed, falling back: ${viaTerm.message || "?"}`);
+  } else {
+    appendDnsLog(
+      "pam_tid not enabled — osascript may only offer password. Run: sh scripts/enable-touchid-sudo-macos.sh"
+    );
+  }
+
+  // 3) Fallback: system admin dialog (frequently password-only for native messaging hosts).
   await runExecFile(
     "osascript",
     ["-e", 'try\ntell application "SystemUIServer" to activate\nend try'],
     { timeout: 5000 }
   );
 
-  // 3) System admin dialog — on MacBooks this commonly shows Touch ID + password.
-  //    (Background tools cannot force biometrics-only; OS always allows password fallback.)
   const apple = [
     `do shell script ${JSON.stringify(shellScript)}`,
-    `with prompt ${JSON.stringify(prompt)}`,
+    `with prompt ${JSON.stringify(
+      `${prompt}\n\n若只有密碼沒有指紋：請先執行\nsh scripts/enable-touchid-sudo-macos.sh\n然後重試（將用 Terminal + Touch ID）。`
+    )}`,
     "with administrator privileges"
   ].join(" ");
 
@@ -2298,7 +2457,7 @@ async function runPrivilegedShell(shellScript, options = {}) {
     ok: false,
     method: "osascript-admin",
     message: cancelled
-      ? "已取消管理員授權。若未出現 Touch ID：確認已登錄指紋，或執行 sh scripts/enable-touchid-sudo-macos.sh"
+      ? "已取消授權。要用 Touch ID：先執行 sh scripts/enable-touchid-sudo-macos.sh，再按 Reinstall resolver。"
       : osa.message || "Failed to elevate privileges."
   };
 }

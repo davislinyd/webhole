@@ -313,6 +313,8 @@ function migrateSettings(items) {
         : 53,
     dnsRules: normalizeDnsRules(items.dnsRules),
     dnsInstallResolverStubs: Boolean(items.dnsInstallResolverStubs),
+    // Opt-in: write /etc/resolver (needs admin). Chrome uses gateway without this.
+    dnsSystemResolver: Boolean(items.dnsSystemResolver),
     // Enforce is the product default (scheme D).
     dnsEnforce: items.dnsEnforce !== false
   };
@@ -874,6 +876,7 @@ function getStoredSettings() {
         dnsDefaultNameserverPort: 53,
         dnsRules: [],
         dnsInstallResolverStubs: false,
+        dnsSystemResolver: false,
         dnsEnforce: true
       },
       (items) => {
@@ -902,6 +905,8 @@ function getStoredSettings() {
 
 function buildDnsNativePayload(settings) {
   const enforce = settings.dnsEnforce !== false;
+  // System /etc/resolver is opt-in. Browser Enforce uses gateway and does not need admin.
+  const systemResolver = Boolean(settings.dnsSystemResolver);
 
   return {
     listenPort: settings.dnsListenPort || DEFAULT_DNS_LISTEN_PORT,
@@ -909,7 +914,7 @@ function buildDnsNativePayload(settings) {
     defaultNameserverPort: settings.dnsDefaultNameserverPort || 53,
     rules: enabledDnsRules(settings.dnsRules),
     enforce,
-    autoInstallResolver: enforce
+    autoInstallResolver: enforce && systemResolver
   };
 }
 
@@ -1581,7 +1586,11 @@ async function handleDnsMessage(message) {
     dnsInstallResolverStubs:
       message.dnsInstallResolverStubs != null
         ? Boolean(message.dnsInstallResolverStubs)
-        : settings.dnsInstallResolverStubs
+        : settings.dnsInstallResolverStubs,
+    dnsSystemResolver:
+      message.dnsSystemResolver != null
+        ? Boolean(message.dnsSystemResolver)
+        : settings.dnsSystemResolver
   };
 
   if (message.action === "dnsStatus") {

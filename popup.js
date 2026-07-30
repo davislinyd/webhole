@@ -57,6 +57,7 @@ const dnsListenPortInput = document.getElementById("dnsListenPort");
 const dnsDefaultNameserverInput = document.getElementById("dnsDefaultNameserver");
 const dnsDefaultNameserverPortInput = document.getElementById("dnsDefaultNameserverPort");
 const dnsEnforceInput = document.getElementById("dnsEnforce");
+const dnsSystemResolverInput = document.getElementById("dnsSystemResolver");
 const addDnsRuleButton = document.getElementById("addDnsRuleButton");
 const enableAllDnsButton = document.getElementById("enableAllDnsButton");
 const disableAllDnsButton = document.getElementById("disableAllDnsButton");
@@ -665,7 +666,8 @@ function collectDnsSettingsFromUi() {
     dnsDefaultNameserver: String(dnsDefaultNameserverInput?.value || DEFAULT_DNS_NAMESERVER).trim(),
     dnsDefaultNameserverPort: Number(dnsDefaultNameserverPortInput?.value) || 53,
     dnsRules: normalizeDnsRules(readDnsRulesFromDom()),
-    dnsEnforce: dnsEnforceInput ? Boolean(dnsEnforceInput.checked) : true
+    dnsEnforce: dnsEnforceInput ? Boolean(dnsEnforceInput.checked) : true,
+    dnsSystemResolver: dnsSystemResolverInput ? Boolean(dnsSystemResolverInput.checked) : false
   };
 }
 
@@ -1695,7 +1697,8 @@ function migrateLoadedSettings(items) {
     dnsDefaultNameserver: String(items.dnsDefaultNameserver || DEFAULT_DNS_NAMESERVER).trim(),
     dnsDefaultNameserverPort: Number(items.dnsDefaultNameserverPort) || 53,
     dnsRules: normalizeDnsRules(items.dnsRules),
-    dnsEnforce: items.dnsEnforce !== false
+    dnsEnforce: items.dnsEnforce !== false,
+    dnsSystemResolver: Boolean(items.dnsSystemResolver)
   };
 }
 
@@ -1713,6 +1716,7 @@ function bootPopup() {
       dnsDefaultNameserverPort: 53,
       dnsRules: [],
       dnsEnforce: true,
+      dnsSystemResolver: false,
       logs: []
     },
     async (items) => {
@@ -1746,6 +1750,10 @@ function bootPopup() {
 
         if (dnsEnforceInput) {
           dnsEnforceInput.checked = migrated.dnsEnforce !== false;
+        }
+
+        if (dnsSystemResolverInput) {
+          dnsSystemResolverInput.checked = Boolean(migrated.dnsSystemResolver);
         }
 
         renderLogs(items?.logs);
@@ -1810,6 +1818,15 @@ dnsListenPortInput?.addEventListener("change", () => saveDnsSettings());
 dnsDefaultNameserverInput?.addEventListener("change", () => saveDnsSettings());
 dnsDefaultNameserverPortInput?.addEventListener("change", () => saveDnsSettings());
 dnsEnforceInput?.addEventListener("change", () => saveDnsSettings());
+dnsSystemResolverInput?.addEventListener("change", () => {
+  saveDnsSettings();
+  // Turning on system resolver may prompt admin once (prefer Terminal Touch ID).
+  if (dnsSystemResolverInput.checked) {
+    setDnsStatus("已開啟系統 resolver：下次 DNS On / Reinstall 才會寫 /etc/resolver");
+  } else {
+    setDnsStatus("已關閉系統 resolver：日常只靠 gateway，通常不需密碼");
+  }
+});
 
 helpToggle?.addEventListener("click", (event) => {
   event.preventDefault();

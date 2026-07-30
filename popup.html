@@ -811,11 +811,19 @@
             </span>
           </label>
         </div>
+        <div class="dns-meta-row">
+          <label style="grid-column: 1 / -1;">
+            <span style="display:flex;gap:6px;align-items:center;min-height:32px;">
+              <input id="dnsSystemResolver" type="checkbox">
+              系統 /etc/resolver（CLI 用，需管理員；預設關＝日常免密碼）
+            </span>
+          </label>
+        </div>
       </div>
       <div class="dns-status" id="dnsEnforceStatus" role="status"></div>
 
       <div id="dnsRulesList"></div>
-      <div class="hint">Domain suffix → nameserver。DNS On 時 Enforce：自動寫 <code>/etc/resolver</code>（管理員對話框可用 <strong>Touch ID</strong> 或密碼）、關 Chrome DoH；有 tunnel 時走 gateway。可選：<code>sh scripts/enable-touchid-sudo-macos.sh</code> 開啟 sudo 指紋。</div>
+      <div class="hint">Domain → nameserver。瀏覽器 Enforce 走 gateway（通常<strong>不必密碼</strong>）。勾「系統 /etc/resolver」才會寫系統 DNS（要授權）。要用 <strong>Touch ID</strong>：先執行 <code>sh scripts/enable-touchid-sudo-macos.sh</code>，再按 Reinstall（會開 Terminal 指紋）。</div>
 
       <div class="dns-test-row">
         <input id="dnsTestName" type="text" placeholder="name.corp.example.com" spellcheck="false" autocomplete="off">

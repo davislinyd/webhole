@@ -50,12 +50,16 @@ function loadConfig() {
               .toLowerCase()
               .replace(/\.$/, ""),
             pathPrefix: String(rule.pathPrefix || ""),
-            socksPort: Number(rule.socksPort) || 0
+            // 0 = connect DIRECT after stub resolve (DNS Enforce / Direct mode)
+            socksPort: Number.isInteger(Number(rule.socksPort))
+              ? Number(rule.socksPort)
+              : Number(rule.port) || 0
           }))
-          .filter((rule) => rule.hostPattern && rule.socksPort > 0)
+          .filter((rule) => rule.hostPattern)
       : [];
     const fallbackSocksPort = Number(raw.fallbackSocksPort) || 0;
-    const mode = raw.mode === "global" ? "global" : "routes";
+    const mode =
+      raw.mode === "global" ? "global" : raw.mode === "enforce" ? "enforce" : "routes";
 
     return { listenHost, listenPort, dnsHost, dnsPort, rules, fallbackSocksPort, mode };
   } catch (error) {
@@ -77,13 +81,19 @@ function hostMatches(host, pattern) {
 }
 
 function selectSocksPort(host, config) {
+  // DNS Enforce / Direct: always resolve via stub, then TCP direct (no SOCKS).
+  if (config.mode === "enforce") {
+    return 0;
+  }
+
   if (config.mode === "global" && config.fallbackSocksPort > 0) {
     return config.fallbackSocksPort;
   }
 
   for (const rule of config.rules) {
-    if (hostMatches(host, rule.hostPattern) && rule.socksPort > 0) {
-      return rule.socksPort;
+    if (hostMatches(host, rule.hostPattern)) {
+      // Explicit 0 = DIRECT after stub resolve (DNS Enforce domain without SOCKS).
+      return rule.socksPort > 0 ? rule.socksPort : 0;
     }
   }
 

@@ -392,6 +392,9 @@ function createPacScript(routes, tunnelMap, fallbackPort, options = {}) {
   const gatewayPort = Number(options.gatewayPort) || 0;
   const useGateway = Boolean(options.useGateway) && gatewayPort > 0;
   const globalViaGateway = Boolean(options.globalViaGateway) && useGateway;
+  const dnsPatterns = Array.isArray(options.dnsPatterns)
+    ? options.dnsPatterns.map((d) => String(d || "").toLowerCase()).filter(Boolean)
+    : [];
 
   const rules = routes
     .map((route) => {
@@ -426,12 +429,39 @@ function FindProxyForURL(url, host) {
 `;
   }
 
+  // DNS Enforce only (Direct mode): force matching hosts through resolve-then-proxy gateway.
+  if (useGateway && dnsPatterns.length && !rules.length && !Number.isInteger(fallbackPort)) {
+    return `
+var WEBHOLE_DNS_PATTERNS = ${JSON.stringify(dnsPatterns)};
+
+function webholeHostMatches(host, pattern) {
+  var normalizedHost = String(host).toLowerCase();
+  var domain = String(pattern).toLowerCase();
+  var suffix = "." + domain;
+  return (
+    normalizedHost === domain ||
+    normalizedHost.slice(-suffix.length) === suffix
+  );
+}
+
+function FindProxyForURL(url, host) {
+  for (var i = 0; i < WEBHOLE_DNS_PATTERNS.length; i += 1) {
+    if (webholeHostMatches(host, WEBHOLE_DNS_PATTERNS[i])) {
+      return "PROXY ${PROXY_HOST}:${gatewayPort}";
+    }
+  }
+  return "DIRECT";
+}
+`;
+  }
+
   const matchedReturn = useGateway
     ? `"PROXY ${PROXY_HOST}:${gatewayPort}"`
     : `"SOCKS5 ${PROXY_HOST}:" + rule.port`;
 
   return `
 var WEBHOLE_RULES = ${JSON.stringify(rules)};
+var WEBHOLE_DNS_PATTERNS = ${JSON.stringify(dnsPatterns)};
 
 function webholePathFromUrl(url) {
   var s = String(url || "");
@@ -485,6 +515,13 @@ function webholePathMatches(path, prefix) {
 }
 
 function FindProxyForURL(url, host) {
+  // DNS Enforce domains always go through local gateway (stub-only resolve).
+  for (var d = 0; d < WEBHOLE_DNS_PATTERNS.length; d += 1) {
+    if (webholeHostMatches(host, WEBHOLE_DNS_PATTERNS[d])) {
+      return "PROXY ${PROXY_HOST}:${gatewayPort}";
+    }
+  }
+
   var path = webholePathFromUrl(url);
 
   for (var i = 0; i < WEBHOLE_RULES.length; i += 1) {
@@ -523,6 +560,7 @@ function setRoutesProxy(routes, tunnelMap, fallbackPort, options = {}) {
 
 function setGlobalProxy(port, options = {}) {
   const gatewayPort = Number(options.gatewayPort) || 0;
+  const dnsPatterns = Array.isArray(options.dnsPatterns) ? options.dnsPatterns : [];
 
   if (options.useGateway && gatewayPort > 0) {
     chrome.proxy.settings.set(
@@ -534,7 +572,8 @@ function setGlobalProxy(port, options = {}) {
             data: createPacScript([], {}, port, {
               useGateway: true,
               gatewayPort,
-              globalViaGateway: true
+              globalViaGateway: true,
+              dnsPatterns
             })
           }
         }
@@ -562,25 +601,74 @@ function setGlobalProxy(port, options = {}) {
   );
 }
 
+function dnsPatternsFromSettings(settings) {
+  return enabledDnsRules(settings.dnsRules || []).map((rule) => rule.domain).filter(Boolean);
+}
+
 async function ensureGatewayForProxy(mode, settings, tunnelMap) {
   const enforce =
     settings.dnsEnforce !== false &&
     Boolean(settings.dnsEnabled) &&
     Boolean(settings.sessionDesiredDns);
   const normalizedMode = normalizeMode(mode);
-
-  if (!enforce || normalizedMode === "direct") {
-    await sendNativeMessage({ action: "gatewayStop" });
-    lastGatewayPort = null;
-    return { useGateway: false, gatewayPort: null };
-  }
+  const dnsPatterns = enforce ? dnsPatternsFromSettings(settings) : [];
 
   const dnsStatus = await sendNativeMessage({ action: "dnsStatus" });
+  const dnsRunning = dnsStatus?.state === "running" && dnsStatus.dns?.port;
 
-  if (dnsStatus?.state !== "running" || !dnsStatus.dns?.port) {
+  // DNS Enforce without tunnels: still need gateway so Chrome cannot use cached/system IPs.
+  if (enforce && dnsRunning && dnsPatterns.length && normalizedMode === "direct") {
+    const response = await sendNativeMessage({
+      action: "gatewayStart",
+      listenPort: DEFAULT_GATEWAY_PORT,
+      dnsPort: dnsStatus.dns.port,
+      mode: "enforce",
+      rules: dnsPatterns.map((domain) => ({ hostPattern: domain, socksPort: 0 })),
+      dnsPatterns,
+      fallbackSocksPort: 0
+    });
+
+    if (!response?.ok || !response.gateway?.port) {
+      appendLog(`Enforce gateway start failed: ${response?.message || "unknown"}`);
+      lastGatewayPort = null;
+      return {
+        useGateway: false,
+        gatewayPort: null,
+        dnsPatterns,
+        reason: response?.message || "gateway failed"
+      };
+    }
+
+    lastGatewayPort = response.gateway.port;
+    appendLog(`Enforce gateway ready on ${PROXY_HOST}:${lastGatewayPort} domains=${dnsPatterns.join(",")}`);
+    return {
+      useGateway: true,
+      gatewayPort: lastGatewayPort,
+      dnsPatterns,
+      enforceOnly: true
+    };
+  }
+
+  if (!enforce || !dnsRunning) {
+    // No DNS enforce: only tunnel gateway when Global/Routes need it (legacy path below).
+    if (normalizedMode === "direct") {
+      await sendNativeMessage({ action: "gatewayStop" });
+      lastGatewayPort = null;
+      return { useGateway: false, gatewayPort: null, dnsPatterns: [] };
+    }
+  }
+
+  if (!dnsRunning && (normalizedMode === "global" || normalizedMode === "routes")) {
+    // Tunnel without DNS enforce: do not use gateway (SOCKS remote DNS).
     await sendNativeMessage({ action: "gatewayStop" });
     lastGatewayPort = null;
-    return { useGateway: false, gatewayPort: null, reason: "dns not running" };
+    return { useGateway: false, gatewayPort: null, dnsPatterns: [] };
+  }
+
+  if (!enforce) {
+    await sendNativeMessage({ action: "gatewayStop" });
+    lastGatewayPort = null;
+    return { useGateway: false, gatewayPort: null, dnsPatterns: [] };
   }
 
   const map = tunnelMap || {};
@@ -596,6 +684,13 @@ async function ensureGatewayForProxy(mode, settings, tunnelMap) {
       socksPort: map[route.hostAlias]
     }));
 
+  // Also register DNS patterns as direct-after-resolve rules when not covered by SOCKS.
+  for (const domain of dnsPatterns) {
+    if (!gatewayRules.some((rule) => rule.hostPattern === domain)) {
+      gatewayRules.push({ hostPattern: domain, pathPrefix: "", socksPort: 0 });
+    }
+  }
+
   let fallbackSocksPort = 0;
 
   if (normalizedMode === "global") {
@@ -604,12 +699,17 @@ async function ensureGatewayForProxy(mode, settings, tunnelMap) {
     fallbackSocksPort = map[defaultHostAlias] || 0;
   }
 
-  if (normalizedMode === "global" && !fallbackSocksPort) {
-    return { useGateway: false, gatewayPort: null, reason: "no global socks" };
+  if (normalizedMode === "global" && !fallbackSocksPort && !dnsPatterns.length) {
+    return { useGateway: false, gatewayPort: null, dnsPatterns, reason: "no global socks" };
   }
 
-  if (normalizedMode === "routes" && !gatewayRules.length && !fallbackSocksPort) {
-    return { useGateway: false, gatewayPort: null, reason: "no route socks" };
+  if (
+    normalizedMode === "routes" &&
+    !gatewayRules.some((r) => r.socksPort > 0) &&
+    !fallbackSocksPort &&
+    !dnsPatterns.length
+  ) {
+    return { useGateway: false, gatewayPort: null, dnsPatterns, reason: "no route socks" };
   }
 
   const response = await sendNativeMessage({
@@ -618,18 +718,55 @@ async function ensureGatewayForProxy(mode, settings, tunnelMap) {
     dnsPort: dnsStatus.dns.port,
     mode: normalizedMode === "global" ? "global" : "routes",
     rules: gatewayRules,
+    dnsPatterns,
     fallbackSocksPort
   });
 
   if (!response?.ok || !response.gateway?.port) {
     appendLog(`Gateway start failed: ${response?.message || "unknown"}`);
     lastGatewayPort = null;
-    return { useGateway: false, gatewayPort: null, reason: response?.message || "gateway failed" };
+    return {
+      useGateway: false,
+      gatewayPort: null,
+      dnsPatterns,
+      reason: response?.message || "gateway failed"
+    };
   }
 
   lastGatewayPort = response.gateway.port;
   appendLog(`Gateway ready on ${PROXY_HOST}:${lastGatewayPort}`);
-  return { useGateway: true, gatewayPort: lastGatewayPort };
+  return {
+    useGateway: true,
+    gatewayPort: lastGatewayPort,
+    dnsPatterns
+  };
+}
+
+function setDnsEnforceProxy(gatewayInfo) {
+  const gatewayPort = Number(gatewayInfo.gatewayPort) || 0;
+  const dnsPatterns = Array.isArray(gatewayInfo.dnsPatterns) ? gatewayInfo.dnsPatterns : [];
+
+  if (!gatewayPort || !dnsPatterns.length) {
+    clearProxy();
+    return;
+  }
+
+  chrome.proxy.settings.set(
+    {
+      scope: "regular",
+      value: {
+        mode: "pac_script",
+        pacScript: {
+          data: createPacScript([], {}, null, {
+            useGateway: true,
+            gatewayPort,
+            dnsPatterns
+          })
+        }
+      }
+    },
+    () => logProxyResult("set dns-enforce")
+  );
 }
 
 async function applyProxy(mode, settings, tunnelMap) {
@@ -644,16 +781,32 @@ async function applyProxy(mode, settings, tunnelMap) {
     const port = map[defaultHostAlias];
 
     if (!Number.isInteger(port)) {
+      // Global without tunnel but DNS enforce: still apply DNS PAC.
+      if (gatewayInfo.useGateway && gatewayInfo.dnsPatterns?.length) {
+        setDnsEnforceProxy(gatewayInfo);
+        return;
+      }
+
       clearProxy();
       return;
     }
 
-    setGlobalProxy(port, gatewayInfo);
+    setGlobalProxy(port, {
+      ...gatewayInfo,
+      dnsPatterns: gatewayInfo.dnsPatterns || []
+    });
     return;
   }
 
   if (normalizedMode === "routes") {
     if (!routes.length || !Object.keys(map).length) {
+      // Routes empty: fall back to DNS-enforce-only PAC if needed.
+      if (gatewayInfo.useGateway && gatewayInfo.dnsPatterns?.length) {
+        appendLog("Proxy routes empty; applying DNS-enforce PAC only");
+        setDnsEnforceProxy(gatewayInfo);
+        return;
+      }
+
       appendLog(
         `Proxy routes skipped: enabledRoutes=${routes.length} tunnelMap=${Object.keys(map).join(",") || "(empty)"}`
       );
@@ -669,9 +822,20 @@ async function applyProxy(mode, settings, tunnelMap) {
     appendLog(
       `Proxy routes apply: ${rulesWithPort.length}/${routes.length} rules, fallback=${
         fallbackPort ? `default:${fallbackPort}` : "direct"
-      }, gateway=${gatewayInfo.useGateway ? gatewayInfo.gatewayPort : "off"}, hosts=${Object.keys(map).join(",")}`
+      }, gateway=${gatewayInfo.useGateway ? gatewayInfo.gatewayPort : "off"}, dnsPatterns=${
+        (gatewayInfo.dnsPatterns || []).join(",") || "(none)"
+      }, hosts=${Object.keys(map).join(",")}`
     );
     setRoutesProxy(routes, map, fallbackPort, gatewayInfo);
+    return;
+  }
+
+  // Direct mode
+  if (gatewayInfo.useGateway && gatewayInfo.dnsPatterns?.length) {
+    appendLog(
+      `Proxy DNS-enforce (Direct): gateway=${gatewayInfo.gatewayPort} domains=${gatewayInfo.dnsPatterns.join(",")}`
+    );
+    setDnsEnforceProxy(gatewayInfo);
     return;
   }
 
@@ -799,7 +963,9 @@ async function enforceDisableSecureDns() {
   if (!current.ok) {
     return {
       ok: false,
-      message: current.message || "Cannot read Secure DNS setting",
+      message:
+        current.message ||
+        "Cannot read Secure DNS — open chrome://settings/security and turn off Secure DNS",
       secureDns: current
     };
   }
@@ -812,18 +978,39 @@ async function enforceDisableSecureDns() {
     return { ok: true, message: "Secure DNS already off", secureDns: current };
   }
 
+  if (current.levelOfControl && current.levelOfControl === "not_controllable") {
+    return {
+      ok: false,
+      message:
+        "Chrome Secure DNS is locked by policy. Disable it manually: chrome://settings/security",
+      secureDns: current
+    };
+  }
+
   const setResult = await setSecureDnsMode("off");
 
   if (!setResult.ok) {
     return {
       ok: false,
-      message: setResult.message || "Failed to disable Secure DNS (DoH)",
+      message:
+        setResult.message ||
+        "Failed to disable Secure DNS (DoH). Manually: chrome://settings/security",
       secureDns: current
     };
   }
 
+  const verified = await getSecureDnsMode();
+
+  if (verified.value !== "off") {
+    return {
+      ok: false,
+      message: `Secure DNS still "${verified.value || "?"}" after set. Manually: chrome://settings/security`,
+      secureDns: verified
+    };
+  }
+
   appendLog("Secure DNS (DoH) set to off for DNS Enforce");
-  return { ok: true, message: "Secure DNS disabled", secureDns: await getSecureDnsMode() };
+  return { ok: true, message: "Secure DNS disabled", secureDns: verified };
 }
 
 async function restoreSecureDnsIfNeeded() {

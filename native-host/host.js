@@ -1736,7 +1736,8 @@ async function gatewayStart(message) {
 
   const listenPort = Number(message.listenPort) || GATEWAY_DEFAULT_PORT;
   const dnsPort = Number(message.dnsPort) || dnsState.port || DNS_DEFAULT_PORT;
-  const mode = message.mode === "global" ? "global" : "routes";
+  const mode =
+    message.mode === "global" ? "global" : message.mode === "enforce" ? "enforce" : "routes";
   const rulesIn = Array.isArray(message.rules) ? message.rules : [];
   const rules = [];
 
@@ -1744,9 +1745,15 @@ async function gatewayStart(message) {
     const hostPattern = String(rule.hostPattern || "")
       .toLowerCase()
       .replace(/\.$/, "");
-    const socksPort = Number(rule.socksPort || rule.port);
+    const rawPort = rule.socksPort != null ? rule.socksPort : rule.port;
+    const socksPort = Number(rawPort);
 
-    if (!hostPattern || !Number.isInteger(socksPort) || socksPort < 1) {
+    if (!hostPattern) {
+      continue;
+    }
+
+    // socksPort 0 = DIRECT after stub resolve (valid for DNS Enforce domains).
+    if (!Number.isInteger(socksPort) || socksPort < 0) {
       continue;
     }
 
@@ -1758,6 +1765,9 @@ async function gatewayStart(message) {
   }
 
   const fallbackSocksPort = Number(message.fallbackSocksPort) || 0;
+  const dnsPatterns = Array.isArray(message.dnsPatterns)
+    ? message.dnsPatterns.map((d) => String(d || "").toLowerCase().replace(/\.$/, "")).filter(Boolean)
+    : [];
 
   if (mode === "global" && !fallbackSocksPort) {
     return {
@@ -1767,12 +1777,29 @@ async function gatewayStart(message) {
     };
   }
 
-  if (mode === "routes" && !rules.length && !fallbackSocksPort) {
+  if (mode === "routes" && !rules.length && !fallbackSocksPort && !dnsPatterns.length) {
     return {
       ok: false,
       state: "error",
-      message: "Gateway has no SOCKS routes."
+      message: "Gateway has no SOCKS routes or DNS patterns."
     };
+  }
+
+  if (mode === "enforce" && !dnsPatterns.length && !rules.length) {
+    return {
+      ok: false,
+      state: "error",
+      message: "Enforce gateway requires at least one DNS domain pattern."
+    };
+  }
+
+  // For enforce mode, ensure every DNS pattern is a host rule (direct after resolve).
+  if (mode === "enforce") {
+    for (const pattern of dnsPatterns) {
+      if (!rules.some((rule) => rule.hostPattern === pattern)) {
+        rules.push({ hostPattern: pattern, pathPrefix: "", socksPort: 0 });
+      }
+    }
   }
 
   writeGatewayConfigFile({
@@ -1782,7 +1809,8 @@ async function gatewayStart(message) {
     dnsPort,
     mode,
     rules,
-    fallbackSocksPort
+    fallbackSocksPort,
+    dnsPatterns
   });
 
   if (dnsState.gateway?.pid) {

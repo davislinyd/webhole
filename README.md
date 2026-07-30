@@ -15,15 +15,15 @@ v0.4 **三閘**（DNS On 且 Enforce 預設開）：
 |----|------|
 | **OS** | 自動寫 `/etc/resolver/<domain>` → `127.0.0.1:53535`，並 flush cache |
 | **Chrome DoH** | 嘗試 `secureDNSMode=off`（需 `privacy` 權限） |
-| **Proxy** | Global/Routes 時走本機 **HTTP CONNECT gateway**：只問 stub 再連 SOCKS（禁止遠端 DNS） |
+| **Proxy** | **含 Direct**：命中 DNS 規則的 host 走本機 **HTTP CONNECT gateway**（只問 stub；無答案 → 502）。有 tunnel 時再經 SOCKS |
 
 ## Modes (proxy)
 
 | Mode | Behavior |
 |------|----------|
-| **Direct** | Clear browser proxy（僅 DNS 時靠 resolver + DoH off） |
+| **Direct** | 一般流量不走 tunnel；**DNS Enforce 規則域仍走 gateway**（強制 stub 解析） |
 | **Global** | 全部流量經 Default SSH Host（Enforce 時經 gateway） |
-| **Routes** | 規則命中走對應 SSH Host；未匹配 DIRECT 或 Default |
+| **Routes** | 規則命中走對應 SSH Host；DNS 規則域優先走 gateway |
 
 ## Split DNS
 
@@ -33,25 +33,23 @@ v0.4 **三閘**（DNS On 且 Enforce 預設開）：
 | Enforce | **On** |
 | 規則 | suffix → Direct IP 或 Via SSH (`ssh -L`) |
 | Default NS | 未命中規則（例 `1.1.1.1`） |
-| 命中規則且上游無答案 | **NXDOMAIN**（避免 macOS fallback 公司 DNS） |
+| 命中規則且上游無答案 | **NXDOMAIN** + gateway **502**（Chrome 開不了） |
 
-### 驗收範例（內網名）
+### 驗收範例（內網名負向 → 1.1.1.1）
 
-**負向**（應解不到、網頁失敗）：
-
-1. 規則：`opscenter.cit.insea.io` → Direct `1.1.1.1`  
-2. **DNS On**（admin 裝 resolver、DoH off）  
+1. Mode **Direct**，規則：`opscenter.cit.insea.io` → Direct `1.1.1.1`，**DNS On**  
+2. 狀態列應有 `gw:18080`（不只 stub）  
 3. 檢查：
    ```sh
-   dig @127.0.0.1 -p 53535 opscenter.cit.insea.io +short   # 空
-   dig opscenter.cit.insea.io +short                       # 應為空
+   dig @127.0.0.1 -p 53535 opscenter.cit.insea.io   # NXDOMAIN
+   python3 -c "import socket; print(socket.getaddrinfo('opscenter.cit.insea.io',443))"
+   # 應失敗
+   # 注意：dig / host（不加 @）在 macOS 可能仍顯示 10.x，不要當標準
    ```
-4. Chrome 開該站 → 應失敗  
+4. Chrome **無痕視窗**開 `https://opscenter.cit.insea.io` → **應失敗**  
+5. 改 nameserver 為 `10.24.11.11` 後 → 應可開  
 
-**正向**：
-
-1. 同 domain → Direct `10.24.11.11`（或你的公司 DNS）  
-2. dig / Chrome 應得到內網 IP 並可連  
+若 Chrome 仍開得了：關掉 Secure DNS（`chrome://settings/security`），並清該站快取／用無痕。
 
 ## Architecture (SVG)
 

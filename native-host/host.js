@@ -1489,22 +1489,23 @@ async function dnsStart(message) {
   let resolverInstalled = false;
   let resolverMessage = "";
 
-  if (autoInstallResolver && config.rules.length) {
-    const installed = await dnsInstallResolver({
-      ...message,
-      listenPort: config.listenPort,
-      defaultNameserver: config.defaultUpstream.nameserver,
-      defaultNameserverPort: config.defaultUpstream.nameserverPort,
-      rules: config.rules.map((rule) => ({ ...rule, enabled: true }))
-    });
-    resolverInstalled = Boolean(installed.ok);
-    resolverMessage = installed.message || "";
+  if (autoInstallResolver) {
+    // Sync stubs to *enabled* domains only. Empty list removes all Webhole stubs.
+    // No admin prompt when already in sync (stops password spam on every reconcile).
+    const synced = await syncResolverStubs(
+      config.rules.map((rule) => rule.domain),
+      config.listenPort,
+      { force: Boolean(message.forceResolverSync) }
+    );
+    resolverInstalled = Boolean(synced.ok) && (synced.state === "installed" || synced.skipped);
+    resolverMessage = synced.message || "";
 
-    if (!installed.ok) {
-      appendDnsLog(`auto resolver install failed: ${resolverMessage}`);
+    if (!synced.ok) {
+      appendDnsLog(`auto resolver sync failed: ${resolverMessage}`);
+      resolverInstalled = false;
+    } else if (synced.state === "absent" || !config.rules.length) {
+      resolverInstalled = false;
     }
-  } else if (autoInstallResolver && !config.rules.length) {
-    resolverMessage = "No DNS rules; resolver stubs skipped.";
   }
 
   const dns = {
@@ -2150,6 +2151,35 @@ function verifyResolverFiles(files, port) {
   return { missing, wrong, ok: missing.length === 0 && wrong.length === 0 };
 }
 
+function resolverFilesForDomains(domains, port) {
+  return [...new Set(domains || [])]
+    .filter((domain) => DOMAIN_RE.test(domain) && !domain.includes("/"))
+    .sort()
+    .map((domain) => `${RESOLVER_DIR}/${domain}`);
+}
+
+/** True when on-disk Webhole stubs already match desired domains + port. */
+function resolversAlreadySynced(domains, port) {
+  const desired = resolverFilesForDomains(domains, port);
+  const onDisk = listManagedResolverFilesOnDisk().sort();
+
+  if (desired.length !== onDisk.length) {
+    return false;
+  }
+
+  for (let i = 0; i < desired.length; i += 1) {
+    if (desired[i] !== onDisk[i]) {
+      return false;
+    }
+  }
+
+  if (!desired.length) {
+    return true;
+  }
+
+  return verifyResolverFiles(desired, port).ok;
+}
+
 function setDnsResolverInstalledFlag(installed) {
   const state = readState();
 
@@ -2198,7 +2228,7 @@ function runExecFile(command, args, options = {}) {
 async function runPrivilegedShell(shellScript, options = {}) {
   const prompt =
     options.prompt ||
-    "Webhole 需要管理員權限以更新 /etc/resolver（可用 Touch ID 或密碼）";
+    "Webhole 需要管理員權限以更新 DNS resolver。\n請使用 Touch ID（指紋）或密碼。";
 
   // 1) Non-interactive sudo if credentials are already cached / NOPASSWD.
   const sudoN = await runExecFile("sudo", ["-n", "/bin/bash", "-c", shellScript], {
@@ -2210,7 +2240,15 @@ async function runPrivilegedShell(shellScript, options = {}) {
     return { ok: true, stdout: sudoN.stdout, method: "sudo-n" };
   }
 
-  // 2) System admin dialog (Touch ID when available on this Mac).
+  // 2) Bring UI session forward so the Security Agent is more likely to offer Touch ID.
+  await runExecFile(
+    "osascript",
+    ["-e", 'try\ntell application "SystemUIServer" to activate\nend try'],
+    { timeout: 5000 }
+  );
+
+  // 3) System admin dialog — on MacBooks this commonly shows Touch ID + password.
+  //    (Background tools cannot force biometrics-only; OS always allows password fallback.)
   const apple = [
     `do shell script ${JSON.stringify(shellScript)}`,
     `with prompt ${JSON.stringify(prompt)}`,
@@ -2232,7 +2270,7 @@ async function runPrivilegedShell(shellScript, options = {}) {
     ok: false,
     method: "osascript-admin",
     message: cancelled
-      ? "已取消管理員授權（可用 Touch ID 或密碼重試）。"
+      ? "已取消管理員授權。若未出現 Touch ID：確認已登錄指紋，或執行 sh scripts/enable-touchid-sudo-macos.sh"
       : osa.message || "Failed to elevate privileges."
   };
 }
@@ -2240,6 +2278,131 @@ async function runPrivilegedShell(shellScript, options = {}) {
 /** @deprecated name kept as alias for call sites */
 async function runOsascriptAdmin(shellScript) {
   return runPrivilegedShell(shellScript);
+}
+
+/**
+ * Sync /etc/resolver to match enabled domains.
+ * - empty domains → uninstall all Webhole stubs (admin only if stubs exist)
+ * - already in sync → no admin prompt
+ * - force: true → always rewrite
+ */
+async function syncResolverStubs(domains, port, options = {}) {
+  if (process.platform !== "darwin") {
+    return {
+      ok: false,
+      state: "error",
+      message: "Resolver stubs are only supported on macOS."
+    };
+  }
+
+  const force = Boolean(options.force);
+  const uniqueDomains = [
+    ...new Set((domains || []).map((d) => normalizeDnsDomain(d)).filter(Boolean))
+  ];
+  const nextFiles = resolverFilesForDomains(uniqueDomains, port);
+  const previous = mergeResolverFileLists(readResolverManifest(), listManagedResolverFilesOnDisk());
+
+  if (!nextFiles.length) {
+    if (!previous.length) {
+      writeResolverManifest([]);
+      setDnsResolverInstalledFlag(false);
+      return {
+        ok: true,
+        state: "absent",
+        message: "No DNS rules enabled; no resolver stubs on disk.",
+        skipped: true
+      };
+    }
+
+    // All rules off / no domains → remove stubs so system DNS takes over.
+    appendDnsLog("sync resolvers: uninstalling all (no enabled domains)");
+    return dnsUninstallResolver();
+  }
+
+  if (!force && resolversAlreadySynced(uniqueDomains, port)) {
+    writeResolverManifest(nextFiles);
+    setDnsResolverInstalledFlag(true);
+    appendDnsLog(`sync resolvers: already in sync (${uniqueDomains.join(", ")}) port=${port}`);
+    return {
+      ok: true,
+      state: "installed",
+      message: `Resolver stubs already up to date (${nextFiles.length}).`,
+      files: nextFiles,
+      skipped: true
+    };
+  }
+
+  const lines = ["mkdir -p /etc/resolver"];
+
+  for (const file of previous) {
+    if (!nextFiles.includes(file)) {
+      lines.push(`rm -f ${JSON.stringify(file)}`);
+    }
+  }
+
+  for (const domain of uniqueDomains) {
+    if (!DOMAIN_RE.test(domain) || domain.includes("/")) {
+      continue;
+    }
+
+    const content = `# Managed by Webhole\nnameserver 127.0.0.1\nport ${port}\n`;
+    const filePath = `${RESOLVER_DIR}/${domain}`;
+    lines.push(
+      `python3 -c ${JSON.stringify(
+        `import pathlib; pathlib.Path(${JSON.stringify(filePath)}).write_text(${JSON.stringify(content)})`
+      )}`
+    );
+  }
+
+  lines.push("dscacheutil -flushcache >/dev/null 2>&1 || true");
+  lines.push("killall -HUP mDNSResponder >/dev/null 2>&1 || true");
+  lines.push("sleep 0.3");
+  lines.push("true");
+
+  const result = await runPrivilegedShell(lines.join(" && "), {
+    prompt:
+      "Webhole 需要更新 /etc/resolver（啟用／停用 DNS 規則）。\n請使用 Touch ID 或輸入密碼。"
+  });
+
+  if (!result.ok) {
+    setDnsResolverInstalledFlag(false);
+    return {
+      ok: false,
+      state: "error",
+      message: result.message || "Failed to sync resolver stubs (admin cancelled?)."
+    };
+  }
+
+  await wait(400);
+  const verification = verifyResolverFiles(nextFiles, port);
+
+  if (!verification.ok) {
+    setDnsResolverInstalledFlag(false);
+    appendDnsLog(
+      `resolver verify failed missing=${verification.missing.join(",")} wrong=${verification.wrong.join(",")}`
+    );
+    return {
+      ok: false,
+      state: "error",
+      message: `Resolver write reported ok but files invalid (missing=${verification.missing.length}, wrong=${verification.wrong.length}).`
+    };
+  }
+
+  writeResolverManifest(nextFiles);
+  setDnsResolverInstalledFlag(true);
+  appendDnsLog(`synced resolver stubs for ${uniqueDomains.join(", ")} port=${port}`);
+
+  const dns = readState().dns;
+  const stubUp = Boolean(dns?.pid && isProcessAlive(dns.pid));
+
+  return {
+    ok: true,
+    state: "installed",
+    message: `Synced ${nextFiles.length} resolver stub(s) → 127.0.0.1:${port}`,
+    files: nextFiles,
+    stubRunning: stubUp,
+    skipped: false
+  };
 }
 
 async function dnsInstallResolver(message) {
@@ -2263,90 +2426,11 @@ async function dnsInstallResolver(message) {
   ];
 
   if (!domains.length) {
-    return {
-      ok: false,
-      state: "error",
-      message: "No enabled DNS rules to install resolver stubs for. Add/enable a rule first."
-    };
+    // Explicit reinstall with no rules → clear stubs.
+    return syncResolverStubs([], port, { force: Boolean(message.force) });
   }
 
-  const previous = mergeResolverFileLists(readResolverManifest(), listManagedResolverFilesOnDisk());
-  const nextFiles = domains
-    .filter((domain) => DOMAIN_RE.test(domain) && !domain.includes("/"))
-    .map((domain) => `${RESOLVER_DIR}/${domain}`);
-  const lines = ["mkdir -p /etc/resolver"];
-
-  // Remove stale Webhole-managed stubs no longer in the rule set.
-  for (const file of previous) {
-    if (!nextFiles.includes(file)) {
-      lines.push(`rm -f ${JSON.stringify(file)}`);
-    }
-  }
-
-  for (const domain of domains) {
-    if (!DOMAIN_RE.test(domain) || domain.includes("/")) {
-      continue;
-    }
-
-    const content = `# Managed by Webhole\nnameserver 127.0.0.1\nport ${port}\n`;
-    const filePath = `${RESOLVER_DIR}/${domain}`;
-    const b64 = Buffer.from(content, "utf8").toString("base64");
-    // macOS base64 accepts -D / -d; write via python for reliability.
-    lines.push(
-      `python3 -c ${JSON.stringify(
-        `import pathlib; pathlib.Path(${JSON.stringify(filePath)}).write_text(${JSON.stringify(content)})`
-      )}`
-    );
-  }
-
-  lines.push("dscacheutil -flushcache >/dev/null 2>&1 || true");
-  lines.push("killall -HUP mDNSResponder >/dev/null 2>&1 || true");
-  lines.push("sleep 0.3");
-  lines.push("true");
-  const result = await runOsascriptAdmin(lines.join(" && "));
-
-  if (!result.ok) {
-    setDnsResolverInstalledFlag(false);
-    return {
-      ok: false,
-      state: "error",
-      message: result.message || "Failed to install resolver stubs (admin cancelled?)."
-    };
-  }
-
-  // Give mDNSResponder a moment, then verify files on disk.
-  await wait(400);
-  const verification = verifyResolverFiles(nextFiles, port);
-
-  if (!verification.ok) {
-    setDnsResolverInstalledFlag(false);
-    appendDnsLog(
-      `resolver verify failed missing=${verification.missing.join(",")} wrong=${verification.wrong.join(",")}`
-    );
-    return {
-      ok: false,
-      state: "error",
-      message: `Resolver write reported ok but files invalid (missing=${verification.missing.length}, wrong=${verification.wrong.length}). Try Reinstall again.`
-    };
-  }
-
-  writeResolverManifest(nextFiles);
-  setDnsResolverInstalledFlag(true);
-  appendDnsLog(`installed resolver stubs for ${domains.join(", ")} port=${port}`);
-
-  const dns = readState().dns;
-  const stubUp = Boolean(dns?.pid && isProcessAlive(dns.pid));
-
-  return {
-    ok: true,
-    state: "installed",
-    message: stubUp
-      ? `Installed ${nextFiles.length} resolver stub(s) → 127.0.0.1:${port}`
-      : `Installed ${nextFiles.length} stub(s) → 127.0.0.1:${port}, but DNS stub is not running — press DNS On`,
-    files: nextFiles,
-    stubRunning: stubUp,
-    warning: stubUp ? "" : "DNS stub not running"
-  };
+  return syncResolverStubs(domains, port, { force: Boolean(message.force) || message.forceInstall === true });
 }
 
 async function dnsUninstallResolver() {

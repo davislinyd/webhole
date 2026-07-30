@@ -761,7 +761,10 @@ function renderDnsRules(rules) {
 
     enabledInput.addEventListener("change", () => {
       row.classList.toggle("is-disabled", !enabledInput.checked);
-      saveDnsSettings();
+      // Single-rule toggle must sync resolvers immediately (All off / uncheck).
+      applyDnsSettingsNow({
+        announce: enabledInput.checked ? "Rule enabled" : "Rule disabled"
+      });
     });
     domainInput.addEventListener("input", () => saveDnsSettings());
     kindSelect.addEventListener("change", () => {
@@ -817,8 +820,79 @@ function setAllDnsRulesEnabled(enabled) {
   }
 
   renderDnsRules(current);
-  saveDnsSettings();
-  setDnsStatus(enabled ? "All DNS rules enabled" : "All DNS rules disabled");
+  // Immediate apply (no debounce): All off must clear /etc/resolver for disabled domains.
+  applyDnsSettingsNow({
+    announce: enabled
+      ? "All DNS rules enabled"
+      : "All DNS rules disabled — removing resolver stubs for them"
+  });
+}
+
+/**
+ * Persist DNS settings immediately and reconcile native DNS/resolvers.
+ */
+function applyDnsSettingsNow(options = {}) {
+  const { announce = "" } = options;
+  clearTimeout(dnsSaveTimer);
+
+  const settings = collectDnsSettingsFromUi();
+  dnsRulesState = settings.dnsRules;
+  const enabledCount = settings.dnsRules.filter((rule) => rule.enabled).length;
+
+  if (announce) {
+    setDnsStatus(announce);
+  }
+
+  return new Promise((resolve) => {
+    chrome.storage.local.set(settings, () => {
+      const error = chrome.runtime.lastError;
+
+      if (error) {
+        setDnsStatus(error.message, true);
+        resolve(null);
+        return;
+      }
+
+      chrome.storage.local.get({ sessionDesiredDns: false, dnsEnabled: false }, (items) => {
+        const active = Boolean(items.sessionDesiredDns) || Boolean(items.dnsEnabled);
+
+        if (!active) {
+          setDnsStatus(
+            announce ||
+              (enabledCount ? `Saved (${enabledCount} enabled)` : "Saved (all rules off)")
+          );
+          resolve(null);
+          return;
+        }
+
+        setDnsStatus(
+          enabledCount
+            ? `Updating DNS (${enabledCount} enabled)…`
+            : "All rules off — clearing /etc/resolver stubs…"
+        );
+
+        sendDnsMessage("dnsReconcile", { dnsRules: settings.dnsRules }, 120000)
+          .then((response) => {
+            setDnsConnectButtonState(response?.state === "running" ? "running" : "stopped");
+            if (response && !response.ok) {
+              setDnsStatus(response.message || "DNS reconcile failed", true);
+            } else {
+              setDnsStatus(
+                enabledCount
+                  ? `DNS updated — ${enabledCount} rule(s) on`
+                  : "All DNS rules off (stubs cleared if admin allowed)"
+              );
+            }
+            refreshDnsStatus().catch(() => {});
+            resolve(response);
+          })
+          .catch((err) => {
+            setDnsStatus(err.message, true);
+            resolve(null);
+          });
+      });
+    });
+  });
 }
 
 function saveDnsSettings(showStatus = true) {
@@ -837,16 +911,21 @@ function saveDnsSettings(showStatus = true) {
       }
 
       if (showStatus) {
-        setDnsStatus("DNS settings saved");
+        const enabledCount = settings.dnsRules.filter((rule) => rule.enabled).length;
+        setDnsStatus(
+          enabledCount ? `DNS settings saved (${enabledCount} on)` : "DNS settings saved (all off)"
+        );
       }
 
       // If DNS session desired, background storage listener will reconcile.
       chrome.storage.local.get({ sessionDesiredDns: false }, (items) => {
         if (items.sessionDesiredDns) {
-          sendDnsMessage("dnsReconcile").then((response) => {
+          sendDnsMessage("dnsReconcile", { dnsRules: settings.dnsRules }).then((response) => {
             setDnsConnectButtonState(response?.state === "running" ? "running" : "stopped");
             if (response && !response.ok) {
               setDnsStatus(response.message || "DNS reconcile failed", true);
+            } else {
+              refreshDnsStatus().catch(() => {});
             }
           });
         }
@@ -1064,7 +1143,9 @@ async function installDnsResolver() {
     });
 
     const response = await sendDnsMessage("dnsInstallResolver", {
-      ensureDnsRunning: true
+      ensureDnsRunning: true,
+      force: true,
+      forceInstall: true
     });
     setDnsStatus(response?.message || "Install finished", !response?.ok);
     setDnsEnforceStatus(

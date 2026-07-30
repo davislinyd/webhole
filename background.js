@@ -1535,7 +1535,9 @@ async function handleDnsMessage(message) {
 
     return sendNativeMessage({
       action: "dnsInstallResolver",
-      ...payload
+      ...payload,
+      force: Boolean(message.force) || Boolean(message.forceInstall),
+      forceInstall: Boolean(message.force) || Boolean(message.forceInstall)
     });
   }
 

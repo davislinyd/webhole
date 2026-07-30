@@ -7,16 +7,17 @@
     <style>
       :root {
         color-scheme: light;
-        --bg: #f7f8fb;
+        --bg: #f0f2f7;
         --surface: #ffffff;
-        --surface-soft: #eef2f7;
-        --line: #d7dde8;
-        --text: #172033;
-        --muted: #6b7280;
+        --surface-soft: #f4f6fa;
+        --line: #e2e8f0;
+        --text: #0f172a;
+        --muted: #64748b;
         --accent: #2563eb;
-        --accent-soft: #eaf1ff;
+        --accent-soft: #eff6ff;
         --danger: #b42318;
-        --success: #157347;
+        --success: #15803d;
+        --radius: 10px;
       }
 
       * {
@@ -24,15 +25,15 @@
       }
 
       html {
-        width: 336px;
+        width: 360px;
         margin: 0;
         background: var(--bg);
         overflow-x: hidden;
       }
 
       body {
-        width: 336px;
-        max-width: 336px;
+        width: 360px;
+        max-width: 360px;
         margin: 0;
         padding: 12px;
         background: var(--bg);
@@ -41,76 +42,70 @@
         overflow-x: hidden;
       }
 
+      /* —— Header —— */
       header {
         display: flex;
-        align-items: center;
+        align-items: flex-start;
         justify-content: space-between;
-        gap: 12px;
+        gap: 10px;
         margin-bottom: 10px;
       }
 
       h1 {
         margin: 0;
-        color: var(--text);
-        font-size: 19px;
-        font-weight: 650;
-        letter-spacing: 0;
+        font-size: 18px;
+        font-weight: 700;
+        letter-spacing: -0.02em;
       }
 
       .endpoint {
+        margin-top: 2px;
         color: var(--muted);
         font-size: 11px;
-      }
-
-      .header-copy {
-        min-width: 0;
+        font-variant-numeric: tabular-nums;
       }
 
       .header-actions {
         display: flex;
         flex: none;
         gap: 10px;
+        padding-top: 2px;
       }
 
-      .section {
-        padding: 10px;
+      /* —— Panels —— */
+      .panel {
+        padding: 12px;
         border: 1px solid var(--line);
-        border-radius: 8px;
+        border-radius: var(--radius);
         background: var(--surface);
       }
 
-      .section + .section {
+      .panel + .panel {
         margin-top: 8px;
       }
 
-      fieldset {
-        margin: 0;
-        padding: 0;
-        border: 0;
-      }
-
-      legend {
-        margin-bottom: 8px;
+      .panel-title {
+        margin: 0 0 8px;
         color: var(--muted);
-        font-size: 12px;
-        font-weight: 600;
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
       }
 
+      .panel-row {
+        display: grid;
+        gap: 8px;
+      }
+
+      /* —— Mode segment —— */
       .modes {
         display: grid;
         grid-template-columns: repeat(3, minmax(0, 1fr));
-        gap: 5px;
-      }
-
-      .tunnel {
-        display: grid;
-        gap: 8px;
-      }
-
-      .tunnel-row {
-        display: grid;
-        grid-template-columns: 1fr auto auto;
-        gap: 8px;
+        gap: 4px;
+        padding: 3px;
+        border-radius: 8px;
+        background: var(--surface-soft);
       }
 
       label.mode {
@@ -120,18 +115,22 @@
         align-items: center;
         min-height: 30px;
         padding: 6px 4px;
-        border: 1px solid var(--line);
+        border: 1px solid transparent;
         border-radius: 6px;
-        background: var(--surface);
+        background: transparent;
         cursor: pointer;
         text-align: center;
-        font-size: 11px;
+        font-size: 12px;
+        font-weight: 600;
         line-height: 1.15;
+        color: var(--muted);
       }
 
       label.mode:has(input:checked) {
-        border-color: var(--accent);
-        background: var(--accent-soft);
+        border-color: var(--line);
+        background: var(--surface);
+        color: var(--text);
+        box-shadow: 0 1px 2px rgba(15, 23, 42, 0.06);
       }
 
       input[type="radio"] {
@@ -141,7 +140,24 @@
         accent-color: var(--accent);
       }
 
-      input[type="text"] {
+      /* —— Connect row —— */
+      .tunnel-row {
+        display: grid;
+        grid-template-columns: 1fr auto auto;
+        gap: 6px;
+        align-items: center;
+      }
+
+      .field-label {
+        display: block;
+        margin-bottom: 6px;
+        color: var(--muted);
+        font-size: 11px;
+        font-weight: 600;
+      }
+
+      input[type="text"],
+      select {
         width: 100%;
         min-width: 0;
         padding: 8px 10px;
@@ -153,7 +169,18 @@
         font: inherit;
       }
 
-      input[type="text"]:focus {
+      select {
+        appearance: none;
+        background-image: linear-gradient(45deg, transparent 50%, var(--muted) 50%),
+          linear-gradient(135deg, var(--muted) 50%, transparent 50%);
+        background-position: calc(100% - 14px) calc(50% - 2px), calc(100% - 10px) calc(50% - 2px);
+        background-size: 4px 4px, 4px 4px;
+        background-repeat: no-repeat;
+        padding-right: 28px;
+      }
+
+      input[type="text"]:focus,
+      select:focus {
         border-color: var(--accent);
       }
 
@@ -171,7 +198,7 @@
       }
 
       .connect-button {
-        min-width: 62px;
+        min-width: 56px;
         transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease;
       }
 
@@ -221,40 +248,29 @@
         opacity: 0.55;
       }
 
-      .domains {
-        display: none;
-      }
-
-      .domains.is-open {
-        display: block;
-      }
-
-      textarea {
-        width: 100%;
-        min-height: 86px;
-        resize: vertical;
-        padding: 10px;
-        border: 1px solid var(--line);
-        border-radius: 8px;
-        outline: none;
-        background: var(--surface);
-        color: var(--text);
-        font: inherit;
-      }
-
-      textarea:focus {
-        border-color: var(--accent);
-      }
-
       .hint {
-        margin-top: 8px;
         color: var(--muted);
         font-size: 11px;
+        line-height: 1.4;
+      }
+
+      .hint code {
+        padding: 1px 4px;
+        border-radius: 4px;
+        background: var(--surface-soft);
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 10px;
+      }
+
+      /* —— Status —— */
+      .status-block {
+        margin-top: 8px;
+        display: grid;
+        gap: 6px;
       }
 
       .status {
-        min-height: 20px;
-        margin-top: 8px;
+        min-height: 18px;
         padding: 8px 10px;
         border-radius: 8px;
         background: var(--surface-soft);
@@ -267,11 +283,190 @@
         color: var(--danger);
       }
 
-      .help {
+      .tunnel-details {
+        display: grid;
+        gap: 4px;
+      }
+
+      .tunnel-details:empty {
         display: none;
       }
 
-      .help.is-open {
+      .tunnel-details .tunnel-line {
+        padding: 5px 8px;
+        border-radius: 6px;
+        border: 1px solid var(--line);
+        background: var(--surface-soft);
+        color: var(--muted);
+        font-size: 11px;
+        word-break: break-all;
+      }
+
+      .tunnel-details .tunnel-line.is-ok {
+        border-color: #bbf7d0;
+        background: #f0fdf4;
+        color: var(--success);
+      }
+
+      .tunnel-details .tunnel-line.is-error {
+        border-color: #f3c0bc;
+        background: #fff0ef;
+        color: var(--danger);
+      }
+
+      /* —— Context panels —— */
+      .context-panel {
+        display: none;
+      }
+
+      .context-panel.is-open {
+        display: grid;
+        gap: 10px;
+      }
+
+      .context-panel.direct-panel.is-open {
+        display: block;
+      }
+
+      /* —— Routes —— */
+      .routes-toolbar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+      }
+
+      .routes-toolbar strong {
+        font-size: 13px;
+      }
+
+      .routes-toolbar-actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        align-items: center;
+      }
+
+      .fallback-bar {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+
+      .fallback-bar .field-label {
+        margin: 0;
+        flex: none;
+        white-space: nowrap;
+      }
+
+      .fallback-modes {
+        flex: 1;
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 4px;
+        padding: 2px;
+        border-radius: 8px;
+        background: var(--surface-soft);
+      }
+
+      .fallback-modes label.mode {
+        min-height: 28px;
+        font-size: 11px;
+      }
+
+      #routesList {
+        display: grid;
+        gap: 6px;
+      }
+
+      .route-row {
+        display: grid;
+        grid-template-columns: auto 1fr auto;
+        grid-template-areas:
+          "enabled pattern remove"
+          ". host host";
+        gap: 6px 8px;
+        align-items: center;
+        padding: 10px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--surface-soft);
+        border-left: 3px solid var(--accent);
+      }
+
+      .route-row.is-disabled {
+        opacity: 0.55;
+        border-left-color: #94a3b8;
+      }
+
+      .route-row input[data-field="enabled"] {
+        grid-area: enabled;
+        width: 15px;
+        height: 15px;
+        margin: 0;
+        accent-color: var(--accent);
+        cursor: pointer;
+      }
+
+      .route-row input[data-field="pattern"] {
+        grid-area: pattern;
+        padding: 6px 8px;
+        font-size: 12px;
+        background: var(--surface);
+      }
+
+      .route-host-row {
+        grid-area: host;
+        display: grid;
+        grid-template-columns: auto 1fr;
+        gap: 6px;
+        align-items: center;
+        min-width: 0;
+      }
+
+      .route-via {
+        color: var(--muted);
+        font-size: 10px;
+        font-weight: 700;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+      }
+
+      .route-row select[data-field="host"] {
+        min-width: 0;
+        width: 100%;
+        padding: 6px 26px 6px 8px;
+        font-size: 12px;
+        text-overflow: ellipsis;
+        background-color: var(--surface);
+      }
+
+      .route-remove {
+        grid-area: remove;
+        min-width: 30px;
+        min-height: 30px;
+        padding: 0;
+        border-color: transparent;
+        background: transparent;
+        color: var(--danger);
+        font-size: 16px;
+        line-height: 1;
+      }
+
+      .route-remove:hover:not(:disabled) {
+        border-color: #fecaca;
+        background: #fff0ef;
+        color: var(--danger);
+      }
+
+      /* —— Secondary: help / log —— */
+      .help,
+      .logs {
+        display: none;
+      }
+
+      .help.is-open,
+      .logs.is-open {
         display: block;
       }
 
@@ -289,7 +484,7 @@
         border-radius: 4px;
         background: var(--surface-soft);
         font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-        font-size: 12px;
+        font-size: 11px;
       }
 
       .utility-row {
@@ -321,14 +516,10 @@
         font-size: 11px;
       }
 
-      .logs {
-        padding-bottom: 8px;
-      }
-
       .log-details {
         display: none;
         margin-top: 8px;
-        max-height: 108px;
+        max-height: 120px;
         overflow: auto;
         gap: 6px;
       }
@@ -341,7 +532,7 @@
         padding: 7px 8px;
         border: 1px solid var(--line);
         border-radius: 8px;
-        background: var(--surface);
+        background: var(--surface-soft);
       }
 
       .log-time {
@@ -354,78 +545,127 @@
         display: block;
         margin-top: 2px;
       }
+
+      fieldset {
+        margin: 0;
+        padding: 0;
+        border: 0;
+        min-width: 0;
+      }
     </style>
   </head>
   <body>
     <header>
       <div class="header-copy">
         <h1>Webhole</h1>
-        <div class="endpoint">SOCKS5 127.0.0.1:1080</div>
+        <div class="endpoint" id="endpointLabel">SOCKS5 127.0.0.1:1080+</div>
       </div>
       <div class="header-actions">
+        <button class="link-button" id="openWindowButton" type="button" title="以獨立視窗開啟（較穩定）">視窗</button>
         <button class="link-button" id="helpToggle" type="button">說明</button>
         <button class="link-button" id="logToggle" type="button">Log</button>
       </div>
     </header>
 
-    <section class="section help" id="helpSection">
+    <!-- PRIMARY: mode + connect + status -->
+    <section class="panel" id="primaryPanel">
+      <div class="panel-row">
+        <fieldset>
+          <div class="panel-title">Mode</div>
+          <div class="modes">
+            <label class="mode" title="不使用 proxy，流量直連。">
+              <input type="radio" name="mode" value="direct">
+              <span>Direct</span>
+            </label>
+            <label class="mode" title="全部流量走 Default SSH Host。">
+              <input type="radio" name="mode" value="global">
+              <span>Global</span>
+            </label>
+            <label class="mode" title="依 Routes 分流；未匹配預設本機。">
+              <input type="radio" name="mode" value="routes">
+              <span>Routes</span>
+            </label>
+          </div>
+        </fieldset>
+
+        <div>
+          <label class="field-label" for="defaultHostSelect" id="defaultHostLabel">SSH Host</label>
+          <div class="tunnel-row">
+            <select id="defaultHostSelect" aria-label="SSH Host">
+              <option value="">Select host…</option>
+            </select>
+            <button id="connectButton" class="connect-button is-disconnected" type="button">On</button>
+            <button id="disconnectButton" type="button">Off</button>
+          </div>
+          <div class="hint" id="defaultHostHint" style="margin-top: 6px;">選擇模式後設定 Host 並連線。</div>
+        </div>
+
+        <div class="status-block">
+          <div class="status" id="status" role="status" aria-live="polite"></div>
+          <div class="tunnel-details" id="tunnelDetails" aria-live="polite"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- CONTEXT: Direct -->
+    <section class="panel context-panel direct-panel" id="directPanel">
+      <div class="hint">Direct：清除瀏覽器 proxy，流量走本機網路。按 On 會改為 Global 並連線。</div>
+    </section>
+
+    <!-- CONTEXT: Routes -->
+    <section class="panel context-panel routes" id="routesSection">
+      <div class="routes-toolbar">
+        <strong>Routes</strong>
+        <div class="routes-toolbar-actions">
+          <button class="link-button" id="enableAllRoutesButton" type="button">All on</button>
+          <button class="link-button" id="disableAllRoutesButton" type="button">All off</button>
+          <button class="link-button" id="addRouteButton" type="button">+ Add</button>
+        </div>
+      </div>
+
+      <div class="fallback-bar" id="routesFallbackRow">
+        <span class="field-label">未匹配</span>
+        <div class="fallback-modes">
+          <label class="mode" title="未命中 route 時走本機，不經 SSH。">
+            <input type="radio" name="routesFallback" value="direct" checked>
+            <span>本機</span>
+          </label>
+          <label class="mode" title="未命中 route 時走上方 SSH Host（需選 Host）。">
+            <input type="radio" name="routesFallback" value="default">
+            <span>Default</span>
+          </label>
+        </div>
+      </div>
+
+      <div id="routesList"></div>
+      <div class="hint">Pattern：<code>host</code> 或 <code>host/path</code>。勾選啟用；via = SOCKS 出口。較長 path 優先。</div>
+    </section>
+
+    <!-- SECONDARY -->
+    <section class="panel help" id="helpSection">
       <strong>操作說明</strong>
       <ol>
         <li>安裝 native host：<code>sh scripts/install-native-host-macos.sh chrome-dev</code></li>
-        <li>可選瀏覽器：<code>chrome</code>、<code>chrome-dev</code>、<code>edge</code>、<code>edge-dev</code>、<code>all</code></li>
-        <li>載入 unpacked extension：<code>/Users/lindav/git/webhole</code></li>
-        <li>輸入 SSH config 的 Host alias，按 On。</li>
+        <li><strong>SSH Host</strong> = SOCKS 出口機，不是目標網站</li>
+        <li><strong>Global</strong>：必選 Host，全部流量走 tunnel</li>
+        <li><strong>Routes</strong>：Host 可空白；只開已啟用規則的出口；未匹配預設本機</li>
+        <li>未匹配選 Default 時，上方 Host 才會作為兜底出口</li>
+        <li>Pattern 可寫 <code>example.com</code> 或 <code>example.com/api</code></li>
+        <li>Popup 不穩時用「視窗」或 <code>⌥⇧W</code></li>
       </ol>
     </section>
 
-    <section class="section logs" id="logSection">
+    <section class="panel logs" id="logSection">
       <div class="utility-row">
         <div class="log-summary">
           <strong>Log</strong>
           <span class="log-summary-text" id="logSummaryText">No logs yet.</span>
           <span class="log-summary-meta" id="logSummaryMeta"></span>
         </div>
-        <div class="header-actions">
-          <button class="link-button" id="clearLogButton" type="button">Clear</button>
-        </div>
+        <button class="link-button" id="clearLogButton" type="button">Clear</button>
       </div>
       <div class="log-details" id="logList"></div>
     </section>
-
-    <section class="section tunnel">
-      <label for="hostAliasInput">SSH Host</label>
-      <div class="tunnel-row">
-        <input id="hostAliasInput" type="text" spellcheck="false" autocomplete="off" placeholder="my-host">
-        <button id="connectButton" class="connect-button is-disconnected" type="button">On</button>
-        <button id="disconnectButton" type="button">Off</button>
-      </div>
-    </section>
-
-    <fieldset class="section">
-      <legend>Mode</legend>
-      <div class="modes">
-        <label class="mode">
-          <input type="radio" name="mode" value="direct">
-          <span>Direct</span>
-        </label>
-        <label class="mode">
-          <input type="radio" name="mode" value="global">
-          <span>Global Tunnel</span>
-        </label>
-        <label class="mode">
-          <input type="radio" name="mode" value="auto">
-          <span>Auto-Switch</span>
-        </label>
-      </div>
-    </fieldset>
-
-    <section class="section domains" id="domainsSection">
-      <label for="domainsInput">Domains</label>
-      <textarea id="domainsInput" spellcheck="false" placeholder="example.com&#10;internal.example"></textarea>
-      <div class="hint">One domain per line. Exact host and subdomains use the tunnel.</div>
-    </section>
-
-    <div class="status" id="status" role="status" aria-live="polite"></div>
 
     <script src="popup.js"></script>
   </body>

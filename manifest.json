@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Webhole",
-  "version": "0.1.0",
-  "description": "Switch Chrome proxy modes for a local SOCKS5 tunnel.",
+  "version": "0.2.8",
+  "description": "Control local SSH SOCKS5 tunnels with global or per-domain routes.",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA44Xkb9nxo2qRxddB2eA40AKEipWCOCa9/Yu1MrYLUWkmaRQ4g616rFGvDOB6fNxX7LfKDXiYruyqXOQIEbnmF/EOaaPDA3HLJqhpvTxBKEqxF6a75OcCa/XJII8NGgs3yG0UhC4i6OdSeqHS41KdkJve4+LI7jgt/vFSWuapA/G3u5O+8XaWjism7qawIPvSdp3B/MV3vC9oMdWc5iTTOYsbEh2LIkcrRmOrU8g+QnMd65VYkLhzbNB4k+kigJTzAyqD616Ypvn/wogCA20paPGBznWPybpN+kQdHO2twqnkZxFoUaE/Sb9G16hWgp3VyxXUoYDs+zmwO3AtatI9ZwIDAQAB",
   "icons": {
     "16": "icons/disconnected/icon-16.png",
@@ -26,6 +26,15 @@
       "32": "icons/disconnected/icon-32.png",
       "48": "icons/disconnected/icon-48.png",
       "128": "icons/disconnected/icon-128.png"
+    }
+  },
+  "commands": {
+    "open-webhole": {
+      "suggested_key": {
+        "default": "Alt+Shift+W",
+        "mac": "Alt+Shift+W"
+      },
+      "description": "Open Webhole in a stable popup window"
     }
   }
 }

@@ -3,21 +3,29 @@
 
 const fs = require("fs");
 const net = require("net");
+const os = require("os");
 const path = require("path");
 const { execFile, spawn } = require("child_process");
 
 const HOST_ALIAS_RE = /^[A-Za-z0-9._-]+$/;
 const PROXY_HOST = "127.0.0.1";
-const PROXY_PORT = 1080;
+const BASE_PORT = 1080;
+const MAX_TUNNELS = 8;
+const MAX_INCLUDE_DEPTH = 16;
+// ProxyCommand / jump hosts often need longer than a few seconds.
+const TUNNEL_READY_TIMEOUT_MS = 30000;
+const TUNNEL_POLL_MS = 200;
+const SSH_STDERR_LIMIT = 4000;
 const RUNTIME_DIR = path.join(__dirname, "runtime");
 const STATE_FILE = path.join(RUNTIME_DIR, "state.json");
 const SSH_LOG_FILE = path.join(RUNTIME_DIR, "ssh.log");
+const DEFAULT_SSH_CONFIG = path.join(os.homedir(), ".ssh", "config");
 
 function ensureRuntimeDir() {
   fs.mkdirSync(RUNTIME_DIR, { recursive: true, mode: 0o700 });
 }
 
-function readState() {
+function readRawState() {
   try {
     return JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
   } catch (error) {
@@ -25,9 +33,71 @@ function readState() {
   }
 }
 
+function normalizeState(raw) {
+  if (!raw || typeof raw !== "object") {
+    return { tunnels: {} };
+  }
+
+  if (raw.tunnels && typeof raw.tunnels === "object") {
+    const tunnels = {};
+
+    for (const [hostAlias, entry] of Object.entries(raw.tunnels)) {
+      if (!entry || typeof entry !== "object") {
+        continue;
+      }
+
+      const pid = Number(entry.pid);
+      const port = Number(entry.port);
+
+      if (!HOST_ALIAS_RE.test(hostAlias) || !Number.isInteger(pid) || !Number.isInteger(port)) {
+        continue;
+      }
+
+      tunnels[hostAlias] = {
+        pid,
+        port,
+        startedAt: entry.startedAt || ""
+      };
+    }
+
+    return { tunnels };
+  }
+
+  // Legacy single-tunnel state.
+  if (raw.pid && raw.hostAlias) {
+    const hostAlias = String(raw.hostAlias);
+    const pid = Number(raw.pid);
+
+    if (HOST_ALIAS_RE.test(hostAlias) && Number.isInteger(pid)) {
+      return {
+        tunnels: {
+          [hostAlias]: {
+            pid,
+            port: BASE_PORT,
+            startedAt: raw.startedAt || ""
+          }
+        }
+      };
+    }
+  }
+
+  return { tunnels: {} };
+}
+
+function readState() {
+  return normalizeState(readRawState());
+}
+
 function writeState(state) {
   ensureRuntimeDir();
-  fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
+  const tunnels = state.tunnels && typeof state.tunnels === "object" ? state.tunnels : {};
+
+  if (Object.keys(tunnels).length === 0) {
+    clearState();
+    return;
+  }
+
+  fs.writeFileSync(STATE_FILE, JSON.stringify({ tunnels }, null, 2));
 }
 
 function appendSshLog(message) {
@@ -71,20 +141,20 @@ function readProcessCommand(pid) {
   });
 }
 
-async function isRecordedSshProcess(pid) {
+async function isRecordedSshProcess(pid, port) {
   const command = await readProcessCommand(pid);
 
   return (
     command.includes("ssh") &&
     command.includes("-N") &&
     command.includes("-D") &&
-    command.includes(`${PROXY_HOST}:${PROXY_PORT}`)
+    command.includes(`${PROXY_HOST}:${port}`)
   );
 }
 
-function isPortOpen() {
+function isPortOpen(port) {
   return new Promise((resolve) => {
-    const socket = net.createConnection({ host: PROXY_HOST, port: PROXY_PORT });
+    const socket = net.createConnection({ host: PROXY_HOST, port });
     let settled = false;
 
     function finish(result) {
@@ -110,180 +180,740 @@ function wait(ms) {
   });
 }
 
-async function getStatus() {
-  const state = readState();
-  const pid = Number(state.pid);
-  const portOpen = await isPortOpen();
-
-  if (!pid || !isProcessAlive(pid)) {
-    if (portOpen) {
-      return {
-        ok: false,
-        state: "error",
-        message: `${PROXY_HOST}:${PROXY_PORT} is already in use by an unknown process.`
-      };
-    }
-
-    clearState();
-    return { ok: true, state: "disconnected" };
-  }
-
-  if (!(await isRecordedSshProcess(pid))) {
-    clearState();
-    return {
-      ok: false,
-      state: "error",
-      message: "Recorded PID is no longer the Webhole ssh process."
-    };
-  }
-
-  return {
-    ok: true,
-    state: portOpen ? "connected" : "starting",
-    pid,
-    hostAlias: state.hostAlias || ""
-  };
-}
-
 function validateHostAlias(hostAlias) {
   if (!HOST_ALIAS_RE.test(hostAlias)) {
     return {
       ok: false,
       state: "error",
-      message: "Invalid SSH Host alias."
+      message: `Invalid SSH Host alias: ${hostAlias || "(empty)"}`
     };
   }
 
   return null;
 }
 
-async function connectTunnel(hostAlias) {
-  const validationError = validateHostAlias(hostAlias);
+function usedPorts(tunnels) {
+  return new Set(Object.values(tunnels).map((entry) => entry.port));
+}
 
-  if (validationError) {
-    return validationError;
+function allocatePort(tunnels, preferredPort) {
+  const taken = usedPorts(tunnels);
+
+  if (Number.isInteger(preferredPort) && preferredPort >= BASE_PORT && !taken.has(preferredPort)) {
+    return preferredPort;
   }
 
-  const status = await getStatus();
+  for (let offset = 0; offset < MAX_TUNNELS * 4; offset += 1) {
+    const port = BASE_PORT + offset;
 
-  if (status.ok && (status.state === "connected" || status.state === "starting")) {
-    return status;
-  }
-
-  if (!status.ok) {
-    return status;
-  }
-
-  ensureRuntimeDir();
-  appendSshLog(`starting ssh tunnel for ${hostAlias}`);
-
-  const stderrFd = fs.openSync(SSH_LOG_FILE, "a");
-  const child = spawn(
-    "ssh",
-    [
-      "-N",
-      "-n",
-      "-D",
-      `${PROXY_HOST}:${PROXY_PORT}`,
-      "-o",
-      "ExitOnForwardFailure=yes",
-      "-o",
-      "BatchMode=yes",
-      hostAlias
-    ],
-    {
-      detached: true,
-      stdio: ["ignore", "ignore", stderrFd]
+    if (!taken.has(port)) {
+      return port;
     }
-  );
+  }
 
-  child.once("error", (error) => {
-    appendSshLog(`ssh spawn failed: ${error.message}`);
-  });
+  return null;
+}
 
-  child.unref();
-  fs.closeSync(stderrFd);
+async function inspectTunnel(hostAlias, entry) {
+  const pid = Number(entry.pid);
+  const port = Number(entry.port);
+  const portOpen = await isPortOpen(port);
 
-  if (!child.pid) {
+  if (!pid || !isProcessAlive(pid)) {
+    if (portOpen) {
+      return {
+        hostAlias,
+        port,
+        pid: pid || 0,
+        state: "error",
+        message: `${PROXY_HOST}:${port} is in use by an unknown process.`
+      };
+    }
+
+    return null;
+  }
+
+  if (!(await isRecordedSshProcess(pid, port))) {
     return {
-      ok: false,
+      hostAlias,
+      port,
+      pid,
       state: "error",
-      message: "ssh failed to start."
+      message: `Recorded PID for ${hostAlias} is no longer the Webhole ssh process.`
     };
   }
 
-  writeState({
-    pid: child.pid,
-    hostAlias,
-    startedAt: new Date().toISOString()
-  });
-
-  for (let i = 0; i < 50; i += 1) {
-    if (!isProcessAlive(child.pid)) {
-      clearState();
-      appendSshLog("ssh exited before opening SOCKS5 port");
-      return {
-        ok: false,
-        state: "error",
-        message: `ssh exited before opening ${PROXY_HOST}:${PROXY_PORT}.`
-      };
-    }
-
-    if (await isPortOpen()) {
-      return {
-        ok: true,
-        state: "connected",
-        pid: child.pid,
-        hostAlias
-      };
-    }
-
-    await wait(100);
-  }
-
-  appendSshLog(`ssh did not open ${PROXY_HOST}:${PROXY_PORT} within 5 seconds`);
-  process.kill(child.pid, "SIGTERM");
-  clearState();
-
   return {
-    ok: false,
-    state: "error",
-    message: `ssh did not open ${PROXY_HOST}:${PROXY_PORT}.`
+    hostAlias,
+    port,
+    pid,
+    state: portOpen ? "connected" : "starting"
   };
 }
 
-async function disconnectTunnel() {
+async function reconcileState() {
   const state = readState();
-  const pid = Number(state.pid);
+  const nextTunnels = {};
+  const reports = [];
+  let hasError = false;
 
-  if (!pid || !isProcessAlive(pid)) {
-    clearState();
-    return { ok: true, state: "disconnected" };
+  for (const [hostAlias, entry] of Object.entries(state.tunnels)) {
+    const report = await inspectTunnel(hostAlias, entry);
+
+    if (!report) {
+      continue;
+    }
+
+    if (report.state === "error") {
+      hasError = true;
+      reports.push(report);
+      continue;
+    }
+
+    nextTunnels[hostAlias] = {
+      pid: report.pid,
+      port: report.port,
+      startedAt: entry.startedAt || ""
+    };
+    reports.push(report);
   }
 
-  if (!(await isRecordedSshProcess(pid))) {
-    clearState();
+  writeState({ tunnels: nextTunnels });
+  return { tunnels: nextTunnels, reports, hasError };
+}
+
+function aggregateState(reports) {
+  if (!reports.length) {
+    return "disconnected";
+  }
+
+  if (reports.every((item) => item.state === "connected")) {
+    return "connected";
+  }
+
+  if (reports.some((item) => item.state === "connected" || item.state === "starting")) {
+    if (reports.some((item) => item.state === "error")) {
+      return "partial";
+    }
+
+    if (reports.some((item) => item.state === "starting")) {
+      return "starting";
+    }
+
+    return "partial";
+  }
+
+  if (reports.some((item) => item.state === "error")) {
+    return "error";
+  }
+
+  return "disconnected";
+}
+
+async function getStatus() {
+  const { reports, hasError } = await reconcileState();
+  const state = aggregateState(reports);
+  const connected = reports.filter((item) => item.state === "connected" || item.state === "starting");
+
+  if (hasError && connected.length === 0) {
     return {
       ok: false,
       state: "error",
-      message: "Recorded PID is no longer the Webhole ssh process."
+      message: reports.find((item) => item.state === "error")?.message || "Tunnel error",
+      tunnels: reports
     };
+  }
+
+  return {
+    ok: true,
+    state,
+    tunnels: reports,
+    message:
+      state === "partial"
+        ? reports
+            .filter((item) => item.state === "error")
+            .map((item) => item.message)
+            .join(" ")
+        : undefined
+  };
+}
+
+async function stopTunnelProcess(pid) {
+  if (!pid || !isProcessAlive(pid)) {
+    return;
   }
 
   process.kill(pid, "SIGTERM");
 
   for (let i = 0; i < 20; i += 1) {
     if (!isProcessAlive(pid)) {
-      clearState();
-      return { ok: true, state: "disconnected" };
+      return;
     }
 
     await wait(100);
   }
 
-  process.kill(pid, "SIGKILL");
+  if (isProcessAlive(pid)) {
+    process.kill(pid, "SIGKILL");
+  }
+}
+
+async function disconnectHost(hostAlias, entry) {
+  const report = await inspectTunnel(hostAlias, entry);
+
+  if (!report || report.state === "error") {
+    return;
+  }
+
+  await stopTunnelProcess(report.pid);
+  appendSshLog(`stopped ssh tunnel for ${hostAlias} on ${PROXY_HOST}:${report.port}`);
+}
+
+function trimSshStderr(stderr) {
+  const text = String(stderr || "").trim();
+
+  if (!text) {
+    return "";
+  }
+
+  if (text.length <= SSH_STDERR_LIMIT) {
+    return text;
+  }
+
+  return text.slice(-SSH_STDERR_LIMIT);
+}
+
+function formatSshFailure(hostAlias, port, reason, stderr) {
+  const detail = trimSshStderr(stderr);
+  const base = `${reason} for ${hostAlias} (${PROXY_HOST}:${port})`;
+  return detail ? `${base}: ${detail}` : `${base}.`;
+}
+
+async function spawnTunnel(hostAlias, port) {
+  ensureRuntimeDir();
+  appendSshLog(`starting ssh tunnel for ${hostAlias} on ${PROXY_HOST}:${port}`);
+
+  let stderrBuf = "";
+  const child = spawn(
+    "ssh",
+    [
+      "-N",
+      "-n",
+      "-D",
+      `${PROXY_HOST}:${port}`,
+      // Independent session: ControlMaster mux clients often exit while
+      // forwards attach to another process, which breaks PID tracking.
+      "-o",
+      "ControlMaster=no",
+      "-o",
+      "ControlPath=none",
+      "-o",
+      "ExitOnForwardFailure=yes",
+      "-o",
+      "BatchMode=yes",
+      "-o",
+      "ConnectTimeout=20",
+      "-o",
+      "ServerAliveInterval=30",
+      "-o",
+      "ServerAliveCountMax=3",
+      hostAlias
+    ],
+    {
+      detached: true,
+      stdio: ["ignore", "ignore", "pipe"]
+    }
+  );
+
+  if (child.stderr) {
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk) => {
+      const text = String(chunk);
+      stderrBuf += text;
+
+      for (const line of text.split(/\r?\n/)) {
+        const trimmed = line.trim();
+
+        if (trimmed) {
+          appendSshLog(`ssh[${hostAlias}] ${trimmed}`);
+        }
+      }
+    });
+  }
+
+  child.once("error", (error) => {
+    appendSshLog(`ssh spawn failed for ${hostAlias}: ${error.message}`);
+    stderrBuf += `${error.message}\n`;
+  });
+
+  child.unref();
+
+  if (!child.pid) {
+    return {
+      ok: false,
+      hostAlias,
+      port,
+      state: "error",
+      message: formatSshFailure(hostAlias, port, "ssh failed to start", stderrBuf)
+    };
+  }
+
+  const deadline = Date.now() + TUNNEL_READY_TIMEOUT_MS;
+
+  while (Date.now() < deadline) {
+    if (!isProcessAlive(child.pid)) {
+      // Allow stderr flush after exit.
+      await wait(150);
+      const message = formatSshFailure(
+        hostAlias,
+        port,
+        "ssh exited before opening SOCKS5 port",
+        stderrBuf
+      );
+      appendSshLog(message);
+      return {
+        ok: false,
+        hostAlias,
+        port,
+        state: "error",
+        message
+      };
+    }
+
+    if (await isPortOpen(port)) {
+      appendSshLog(`ssh tunnel ready for ${hostAlias} on ${PROXY_HOST}:${port} pid=${child.pid}`);
+      return {
+        ok: true,
+        hostAlias,
+        port,
+        pid: child.pid,
+        state: "connected",
+        startedAt: new Date().toISOString()
+      };
+    }
+
+    await wait(TUNNEL_POLL_MS);
+  }
+
+  const timeoutMessage = formatSshFailure(
+    hostAlias,
+    port,
+    `ssh did not open SOCKS5 within ${TUNNEL_READY_TIMEOUT_MS / 1000}s`,
+    stderrBuf
+  );
+  appendSshLog(timeoutMessage);
+  await stopTunnelProcess(child.pid);
+
+  return {
+    ok: false,
+    hostAlias,
+    port,
+    state: "error",
+    message: timeoutMessage
+  };
+}
+
+function normalizeHostAliases(message) {
+  const values = [];
+
+  if (Array.isArray(message.hostAliases)) {
+    values.push(...message.hostAliases);
+  }
+
+  if (message.hostAlias) {
+    values.push(message.hostAlias);
+  }
+
+  const seen = new Set();
+  const result = [];
+
+  for (const value of values) {
+    const hostAlias = String(value || "").trim();
+
+    if (!hostAlias || seen.has(hostAlias)) {
+      continue;
+    }
+
+    seen.add(hostAlias);
+    result.push(hostAlias);
+  }
+
+  return result;
+}
+
+async function connectTunnels(hostAliases) {
+  if (!hostAliases.length) {
+    return {
+      ok: false,
+      state: "error",
+      message: "No SSH Host aliases provided.",
+      tunnels: []
+    };
+  }
+
+  if (hostAliases.length > MAX_TUNNELS) {
+    return {
+      ok: false,
+      state: "error",
+      message: `At most ${MAX_TUNNELS} tunnels are supported.`,
+      tunnels: []
+    };
+  }
+
+  for (const hostAlias of hostAliases) {
+    const validationError = validateHostAlias(hostAlias);
+
+    if (validationError) {
+      return { ...validationError, tunnels: [] };
+    }
+  }
+
+  const reconciled = await reconcileState();
+  let tunnels = { ...reconciled.tunnels };
+
+  // Stop tunnels that are no longer requested.
+  for (const [hostAlias, entry] of Object.entries(tunnels)) {
+    if (!hostAliases.includes(hostAlias)) {
+      await disconnectHost(hostAlias, entry);
+      delete tunnels[hostAlias];
+    }
+  }
+
+  writeState({ tunnels });
+
+  const reports = [];
+
+  for (const hostAlias of hostAliases) {
+    const existing = tunnels[hostAlias];
+
+    if (existing) {
+      const report = await inspectTunnel(hostAlias, existing);
+
+      if (report && (report.state === "connected" || report.state === "starting")) {
+        reports.push(report);
+        continue;
+      }
+
+      if (existing.pid) {
+        await stopTunnelProcess(existing.pid);
+      }
+
+      delete tunnels[hostAlias];
+      writeState({ tunnels });
+    }
+
+    const preferredPort = existing?.port;
+    const port = allocatePort(tunnels, preferredPort);
+
+    if (!port) {
+      reports.push({
+        hostAlias,
+        port: 0,
+        state: "error",
+        message: "No free local SOCKS port available."
+      });
+      continue;
+    }
+
+    if (await isPortOpen(port)) {
+      // Port taken by something else; try next free ports.
+      let assigned = null;
+
+      for (let offset = 0; offset < MAX_TUNNELS * 4; offset += 1) {
+        const candidate = BASE_PORT + offset;
+
+        if (usedPorts(tunnels).has(candidate)) {
+          continue;
+        }
+
+        if (!(await isPortOpen(candidate))) {
+          assigned = candidate;
+          break;
+        }
+      }
+
+      if (!assigned) {
+        reports.push({
+          hostAlias,
+          port,
+          state: "error",
+          message: `No free local SOCKS port near ${BASE_PORT}.`
+        });
+        continue;
+      }
+
+      const spawned = await spawnTunnel(hostAlias, assigned);
+
+      if (spawned.ok) {
+        tunnels[hostAlias] = {
+          pid: spawned.pid,
+          port: spawned.port,
+          startedAt: spawned.startedAt
+        };
+        writeState({ tunnels });
+        reports.push({
+          hostAlias,
+          port: spawned.port,
+          pid: spawned.pid,
+          state: "connected"
+        });
+      } else {
+        reports.push(spawned);
+      }
+
+      continue;
+    }
+
+    const spawned = await spawnTunnel(hostAlias, port);
+
+    if (spawned.ok) {
+      tunnels[hostAlias] = {
+        pid: spawned.pid,
+        port: spawned.port,
+        startedAt: spawned.startedAt
+      };
+      writeState({ tunnels });
+      reports.push({
+        hostAlias,
+        port: spawned.port,
+        pid: spawned.pid,
+        state: "connected"
+      });
+    } else {
+      reports.push(spawned);
+    }
+  }
+
+  const state = aggregateState(reports);
+  const ok = reports.some((item) => item.state === "connected" || item.state === "starting");
+
+  return {
+    ok,
+    state: ok ? state : "error",
+    tunnels: reports,
+    message: ok
+      ? state === "partial"
+        ? reports
+            .filter((item) => item.state === "error")
+            .map((item) => item.message)
+            .join(" ")
+        : undefined
+      : reports.find((item) => item.state === "error")?.message || "Failed to connect tunnels."
+  };
+}
+
+async function disconnectAll() {
+  const state = readState();
+
+  for (const [hostAlias, entry] of Object.entries(state.tunnels)) {
+    await disconnectHost(hostAlias, entry);
+  }
+
   clearState();
-  return { ok: true, state: "disconnected" };
+  return { ok: true, state: "disconnected", tunnels: [] };
+}
+
+function expandHomePath(value) {
+  if (value === "~") {
+    return os.homedir();
+  }
+
+  if (value.startsWith("~/") || value.startsWith("~\\")) {
+    return path.join(os.homedir(), value.slice(2));
+  }
+
+  return value;
+}
+
+function resolveConfigPath(value, baseDir) {
+  const expanded = expandHomePath(value.trim());
+
+  if (!expanded) {
+    return "";
+  }
+
+  return path.isAbsolute(expanded) ? expanded : path.resolve(baseDir, expanded);
+}
+
+function matchSimpleGlob(name, pattern) {
+  let regexSource = "^";
+
+  for (const char of pattern) {
+    if (char === "*") {
+      regexSource += ".*";
+    } else if (char === "?") {
+      regexSource += ".";
+    } else if (/[.+^${}()|[\]\\]/.test(char)) {
+      regexSource += `\\${char}`;
+    } else {
+      regexSource += char;
+    }
+  }
+
+  regexSource += "$";
+  return new RegExp(regexSource).test(name);
+}
+
+function expandIncludePaths(pattern, baseDir) {
+  const resolved = resolveConfigPath(pattern, baseDir);
+
+  if (!resolved) {
+    return [];
+  }
+
+  if (!/[*?]/.test(resolved)) {
+    return [resolved];
+  }
+
+  const dir = path.dirname(resolved);
+  const filePattern = path.basename(resolved);
+
+  try {
+    return fs
+      .readdirSync(dir, { withFileTypes: true })
+      .filter((entry) => entry.isFile() && matchSimpleGlob(entry.name, filePattern))
+      .map((entry) => path.join(dir, entry.name));
+  } catch (error) {
+    return [];
+  }
+}
+
+function tokenizeConfigLine(line) {
+  const tokens = [];
+  let current = "";
+  let quote = null;
+
+  for (let i = 0; i < line.length; i += 1) {
+    const char = line[i];
+
+    if (quote) {
+      if (char === quote) {
+        quote = null;
+      } else {
+        current += char;
+      }
+      continue;
+    }
+
+    if (char === '"' || char === "'") {
+      quote = char;
+      continue;
+    }
+
+    if (/\s/.test(char)) {
+      if (current) {
+        tokens.push(current);
+        current = "";
+      }
+      continue;
+    }
+
+    current += char;
+  }
+
+  if (current) {
+    tokens.push(current);
+  }
+
+  return tokens;
+}
+
+function isConcreteHostAlias(token) {
+  if (!token || token.startsWith("!")) {
+    return false;
+  }
+
+  if (/[*?]/.test(token)) {
+    return false;
+  }
+
+  return HOST_ALIAS_RE.test(token);
+}
+
+function collectHostsFromConfig(filePath, hosts, visited, depth) {
+  if (depth > MAX_INCLUDE_DEPTH) {
+    return;
+  }
+
+  let resolvedPath;
+
+  try {
+    resolvedPath = fs.realpathSync(filePath);
+  } catch (error) {
+    if (error.code === "ENOENT") {
+      return;
+    }
+
+    throw error;
+  }
+
+  if (visited.has(resolvedPath)) {
+    return;
+  }
+
+  visited.add(resolvedPath);
+
+  const content = fs.readFileSync(resolvedPath, "utf8");
+  const baseDir = path.dirname(resolvedPath);
+
+  for (const rawLine of content.split(/\r?\n/)) {
+    const line = rawLine.replace(/#.*$/, "").trim();
+
+    if (!line) {
+      continue;
+    }
+
+    const tokens = tokenizeConfigLine(line);
+
+    if (tokens.length < 2) {
+      continue;
+    }
+
+    const keyword = tokens[0].toLowerCase();
+
+    if (keyword === "host") {
+      for (const token of tokens.slice(1)) {
+        if (isConcreteHostAlias(token)) {
+          hosts.add(token);
+        }
+      }
+      continue;
+    }
+
+    if (keyword === "include") {
+      for (const pattern of tokens.slice(1)) {
+        for (const includePath of expandIncludePaths(pattern, baseDir)) {
+          collectHostsFromConfig(includePath, hosts, visited, depth + 1);
+        }
+      }
+    }
+  }
+}
+
+function listSshHosts() {
+  const hosts = new Set();
+  const visited = new Set();
+
+  try {
+    collectHostsFromConfig(DEFAULT_SSH_CONFIG, hosts, visited, 0);
+  } catch (error) {
+    if (error.code === "ENOENT") {
+      return { ok: true, state: "ready", hosts: [] };
+    }
+
+    return {
+      ok: false,
+      state: "error",
+      message: `Failed to read SSH config: ${error.message}`,
+      hosts: []
+    };
+  }
+
+  return {
+    ok: true,
+    state: "ready",
+    hosts: Array.from(hosts).sort((a, b) => a.localeCompare(b))
+  };
 }
 
 function readNativeMessage() {
@@ -358,12 +988,16 @@ async function handleMessage(message) {
     return getStatus();
   }
 
+  if (message.action === "listHosts") {
+    return listSshHosts();
+  }
+
   if (message.action === "connect") {
-    return connectTunnel(String(message.hostAlias || "").trim());
+    return connectTunnels(normalizeHostAliases(message));
   }
 
   if (message.action === "disconnect") {
-    return disconnectTunnel();
+    return disconnectAll();
   }
 
   return { ok: false, state: "error", message: "Unknown action." };

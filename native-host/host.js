@@ -2165,21 +2165,81 @@ function setDnsResolverInstalledFlag(installed) {
   });
 }
 
-async function runOsascriptAdmin(shellScript) {
+function runExecFile(command, args, options = {}) {
   return new Promise((resolve) => {
-    const apple = `do shell script ${JSON.stringify(shellScript)} with administrator privileges`;
-    execFile("osascript", ["-e", apple], { timeout: 120000 }, (error, stdout, stderr) => {
+    execFile(command, args, { timeout: options.timeout || 120000, ...options }, (error, stdout, stderr) => {
       if (error) {
         resolve({
           ok: false,
-          message: String(stderr || error.message || "osascript failed").trim()
+          message: String(stderr || error.message || `${command} failed`).trim(),
+          stdout: String(stdout || ""),
+          stderr: String(stderr || "")
         });
         return;
       }
 
-      resolve({ ok: true, stdout: String(stdout || "") });
+      resolve({ ok: true, stdout: String(stdout || ""), stderr: String(stderr || "") });
     });
   });
+}
+
+/**
+ * Run a shell script with elevation.
+ *
+ * Order:
+ * 1) sudo -n (cached / passwordless) — no UI
+ * 2) osascript "with administrator privileges" — system dialog; on MacBook with
+ *    Touch ID enrolled this dialog usually offers Touch ID + password
+ *
+ * True "prefer Touch ID for sudo in Terminal" is enabled separately via
+ * scripts/enable-touchid-sudo-macos.sh (pam_tid). That helps interactive sudo;
+ * the Security Agent dialog for (2) already supports Touch ID when the OS allows it.
+ */
+async function runPrivilegedShell(shellScript, options = {}) {
+  const prompt =
+    options.prompt ||
+    "Webhole 需要管理員權限以更新 /etc/resolver（可用 Touch ID 或密碼）";
+
+  // 1) Non-interactive sudo if credentials are already cached / NOPASSWD.
+  const sudoN = await runExecFile("sudo", ["-n", "/bin/bash", "-c", shellScript], {
+    timeout: 60000
+  });
+
+  if (sudoN.ok) {
+    appendDnsLog("privileged shell via sudo -n");
+    return { ok: true, stdout: sudoN.stdout, method: "sudo-n" };
+  }
+
+  // 2) System admin dialog (Touch ID when available on this Mac).
+  const apple = [
+    `do shell script ${JSON.stringify(shellScript)}`,
+    `with prompt ${JSON.stringify(prompt)}`,
+    "with administrator privileges"
+  ].join(" ");
+
+  const osa = await runExecFile("osascript", ["-e", apple], { timeout: 180000 });
+
+  if (osa.ok) {
+    appendDnsLog("privileged shell via osascript admin dialog");
+    return { ok: true, stdout: osa.stdout, method: "osascript-admin" };
+  }
+
+  const cancelled =
+    /user canceled|cancelled|(-128)/i.test(osa.message || "") ||
+    /user canceled|cancelled|(-128)/i.test(osa.stderr || "");
+
+  return {
+    ok: false,
+    method: "osascript-admin",
+    message: cancelled
+      ? "已取消管理員授權（可用 Touch ID 或密碼重試）。"
+      : osa.message || "Failed to elevate privileges."
+  };
+}
+
+/** @deprecated name kept as alias for call sites */
+async function runOsascriptAdmin(shellScript) {
+  return runPrivilegedShell(shellScript);
 }
 
 async function dnsInstallResolver(message) {

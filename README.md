@@ -66,7 +66,17 @@ sh scripts/install-native-host-macos.sh chrome-dev
 ```
 
 Chrome → 載入未封裝 extension（專案根目錄）。  
-DNS On 會要求 **管理員密碼**（寫 `/etc/resolver`）。
+DNS On / Reinstall resolver 會跳出 **系統管理員授權**（寫 `/etc/resolver`）。
+
+### Touch ID（指紋）
+
+- 在有 **Touch ID** 的 Mac 上，該對話框通常可直接用指紋（也可改輸密碼）。
+- 若只看到密碼、沒有指紋：確認已登錄指紋、非純遠端登入，並到「系統設定 → Touch ID 與密碼」檢查。
+- 可選：啟用 **sudo 的 Touch ID**（Terminal 用）：
+  ```sh
+  sh scripts/enable-touchid-sudo-macos.sh
+  sudo -v   # 應出現 Touch ID
+  ```
 
 ## File roles
 

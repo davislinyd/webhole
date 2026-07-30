@@ -1,11 +1,16 @@
 const DEFAULT_MODE = "direct";
 const HOST_ALIAS_RE = /^[A-Za-z0-9._-]+$/;
 const DOMAIN_PATTERN_RE = /^[a-z0-9._-]+$/;
+const IPV4_RE = /^(?:\d{1,3}\.){3}\d{1,3}$/;
 const LOG_LIMIT = 80;
 const MAX_ROUTES = 50;
+const MAX_DNS_RULES = 50;
 const VALID_MODES = new Set(["direct", "global", "routes"]);
 const VALID_ROUTES_FALLBACKS = new Set(["direct", "default"]);
+const VALID_DNS_KINDS = new Set(["direct", "via_ssh"]);
 const DEFAULT_ROUTES_FALLBACK = "direct";
+const DEFAULT_DNS_LISTEN_PORT = 53535;
+const DEFAULT_DNS_NAMESERVER = "1.1.1.1";
 
 const popupOpenSource = new URLSearchParams(window.location.search).get("src") || "action";
 const popupOpenAt = Date.now();
@@ -47,10 +52,28 @@ const openWindowButton = document.getElementById("openWindowButton");
 const statusEl = document.getElementById("status");
 const tunnelDetailsEl = document.getElementById("tunnelDetails");
 const endpointLabel = document.getElementById("endpointLabel");
+const dnsRulesList = document.getElementById("dnsRulesList");
+const dnsListenPortInput = document.getElementById("dnsListenPort");
+const dnsDefaultNameserverInput = document.getElementById("dnsDefaultNameserver");
+const dnsDefaultNameserverPortInput = document.getElementById("dnsDefaultNameserverPort");
+const dnsInstallResolverStubsInput = document.getElementById("dnsInstallResolverStubs");
+const addDnsRuleButton = document.getElementById("addDnsRuleButton");
+const enableAllDnsButton = document.getElementById("enableAllDnsButton");
+const disableAllDnsButton = document.getElementById("disableAllDnsButton");
+const dnsConnectButton = document.getElementById("dnsConnectButton");
+const dnsDisconnectButton = document.getElementById("dnsDisconnectButton");
+const dnsTestNameInput = document.getElementById("dnsTestName");
+const dnsTestTypeSelect = document.getElementById("dnsTestType");
+const dnsQueryButton = document.getElementById("dnsQueryButton");
+const dnsStatusEl = document.getElementById("dnsStatus");
+const dnsInstallResolverButton = document.getElementById("dnsInstallResolverButton");
+const dnsUninstallResolverButton = document.getElementById("dnsUninstallResolverButton");
 
 let saveTimer = 0;
+let dnsSaveTimer = 0;
 let availableHosts = [];
 let routesState = [];
+let dnsRulesState = [];
 
 // Paint shell immediately; data loads after first frame (see bootPopup).
 if (statusEl) {
@@ -465,6 +488,478 @@ function addRoute() {
 
   const lastPattern = routesList.querySelector(".route-row:last-child [data-field='pattern']");
   lastPattern?.focus();
+}
+
+function isValidIpv4(value) {
+  if (!IPV4_RE.test(String(value || ""))) {
+    return false;
+  }
+
+  return String(value)
+    .split(".")
+    .every((part) => {
+      const n = Number(part);
+      return n >= 0 && n <= 255;
+    });
+}
+
+function createDnsRuleId() {
+  return `d_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function normalizeDnsDomain(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\.$/, "");
+}
+
+function normalizeDnsRules(rules) {
+  const values = Array.isArray(rules) ? rules : [];
+  const result = [];
+  const seen = new Set();
+
+  for (const rule of values) {
+    if (!rule || typeof rule !== "object") {
+      continue;
+    }
+
+    const domain = normalizeDnsDomain(rule.domain);
+    const kind = VALID_DNS_KINDS.has(rule.kind) ? rule.kind : "direct";
+    const nameserver = String(rule.nameserver || "").trim();
+    const nameserverPort = Number(rule.nameserverPort) || 53;
+    const hostAlias = normalizeHostAlias(rule.hostAlias);
+    const enabled = rule.enabled !== false;
+    const key = `${rule.id || ""}\0${domain}\0${kind}\0${nameserver}\0${nameserverPort}\0${hostAlias}`;
+
+    if (seen.has(key)) {
+      continue;
+    }
+
+    seen.add(key);
+    result.push({
+      id: String(rule.id || createDnsRuleId()),
+      domain,
+      kind,
+      nameserver,
+      nameserverPort,
+      hostAlias: kind === "via_ssh" ? hostAlias : "",
+      enabled
+    });
+
+    if (result.length >= MAX_DNS_RULES) {
+      break;
+    }
+  }
+
+  result.sort((a, b) => (b.domain || "").length - (a.domain || "").length);
+  return result;
+}
+
+function setDnsStatus(message, isError = false) {
+  if (!dnsStatusEl) {
+    return;
+  }
+
+  dnsStatusEl.textContent = message || "";
+  dnsStatusEl.classList.toggle("is-error", Boolean(isError));
+}
+
+function setDnsConnectButtonState(state) {
+  if (!dnsConnectButton) {
+    return;
+  }
+
+  dnsConnectButton.classList.remove("is-connected", "is-disconnected", "is-pending");
+
+  if (state === "running" || state === "connected") {
+    dnsConnectButton.classList.add("is-connected");
+    dnsConnectButton.textContent = "DNS On";
+    return;
+  }
+
+  if (state === "starting") {
+    dnsConnectButton.classList.add("is-pending");
+    dnsConnectButton.textContent = "DNS On";
+    return;
+  }
+
+  dnsConnectButton.classList.add("is-disconnected");
+  dnsConnectButton.textContent = "DNS On";
+}
+
+function readDnsRulesFromDom() {
+  if (!dnsRulesList) {
+    return [];
+  }
+
+  const rows = Array.from(dnsRulesList.querySelectorAll(".dns-rule-row"));
+  const rules = [];
+
+  for (const row of rows) {
+    const enabledInput = row.querySelector('[data-field="enabled"]');
+    const domainInput = row.querySelector('[data-field="domain"]');
+    const kindSelect = row.querySelector('[data-field="kind"]');
+    const nsInput = row.querySelector('[data-field="nameserver"]');
+    const portInput = row.querySelector('[data-field="nameserverPort"]');
+    const hostSelect = row.querySelector('[data-field="host"]');
+
+    rules.push({
+      id: row.dataset.ruleId || createDnsRuleId(),
+      domain: normalizeDnsDomain(domainInput?.value || ""),
+      kind: kindSelect?.value === "via_ssh" ? "via_ssh" : "direct",
+      nameserver: String(nsInput?.value || "").trim(),
+      nameserverPort: Number(portInput?.value) || 53,
+      hostAlias: normalizeHostAlias(hostSelect?.value || ""),
+      enabled: enabledInput ? Boolean(enabledInput.checked) : true
+    });
+  }
+
+  return rules;
+}
+
+function collectDnsSettingsFromUi() {
+  return {
+    dnsListenPort: Number(dnsListenPortInput?.value) || DEFAULT_DNS_LISTEN_PORT,
+    dnsDefaultNameserver: String(dnsDefaultNameserverInput?.value || DEFAULT_DNS_NAMESERVER).trim(),
+    dnsDefaultNameserverPort: Number(dnsDefaultNameserverPortInput?.value) || 53,
+    dnsRules: normalizeDnsRules(readDnsRulesFromDom()),
+    dnsInstallResolverStubs: Boolean(dnsInstallResolverStubsInput?.checked)
+  };
+}
+
+function renderDnsRules(rules) {
+  if (!dnsRulesList) {
+    return;
+  }
+
+  dnsRulesState = normalizeDnsRules(rules);
+  dnsRulesList.replaceChildren();
+
+  if (!dnsRulesState.length) {
+    const empty = document.createElement("div");
+    empty.className = "hint";
+    empty.textContent = "No DNS rules. Click + Add.";
+    dnsRulesList.append(empty);
+    return;
+  }
+
+  for (const rule of dnsRulesState) {
+    const row = document.createElement("div");
+    row.className = `dns-rule-row${rule.enabled ? "" : " is-disabled"}`;
+    row.dataset.ruleId = rule.id;
+
+    const enabledInput = document.createElement("input");
+    enabledInput.type = "checkbox";
+    enabledInput.dataset.field = "enabled";
+    enabledInput.checked = rule.enabled !== false;
+    enabledInput.title = "Enable this DNS rule";
+
+    const domainInput = document.createElement("input");
+    domainInput.type = "text";
+    domainInput.dataset.field = "domain";
+    domainInput.placeholder = "corp.example.com";
+    domainInput.spellcheck = false;
+    domainInput.autocomplete = "off";
+    domainInput.value = rule.domain || "";
+
+    const removeButton = document.createElement("button");
+    removeButton.type = "button";
+    removeButton.className = "dns-remove route-remove";
+    removeButton.title = "Remove DNS rule";
+    removeButton.textContent = "×";
+
+    const kindRow = document.createElement("div");
+    kindRow.className = "dns-kind-row";
+    const kindSelect = document.createElement("select");
+    kindSelect.dataset.field = "kind";
+    kindSelect.innerHTML = '<option value="direct">Direct</option><option value="via_ssh">Via SSH</option>';
+    kindSelect.value = rule.kind === "via_ssh" ? "via_ssh" : "direct";
+    kindRow.append(kindSelect);
+
+    const serverRow = document.createElement("div");
+    serverRow.className = "dns-server-row";
+    const nsInput = document.createElement("input");
+    nsInput.type = "text";
+    nsInput.dataset.field = "nameserver";
+    nsInput.placeholder = "10.0.0.53";
+    nsInput.spellcheck = false;
+    nsInput.value = rule.nameserver || "";
+    const portInput = document.createElement("input");
+    portInput.type = "number";
+    portInput.dataset.field = "nameserverPort";
+    portInput.min = "1";
+    portInput.max = "65535";
+    portInput.value = String(rule.nameserverPort || 53);
+    serverRow.append(nsInput, portInput);
+
+    const hostRow = document.createElement("div");
+    hostRow.className = "dns-host-row";
+    const viaLabel = document.createElement("span");
+    viaLabel.className = "route-via";
+    viaLabel.textContent = "via";
+    const hostSelect = document.createElement("select");
+    hostSelect.dataset.field = "host";
+    hostSelect.replaceChildren(buildHostSelectOptions(rule.hostAlias, true));
+    hostSelect.value = rule.hostAlias || "";
+    hostRow.append(viaLabel, hostSelect);
+    hostRow.hidden = rule.kind !== "via_ssh";
+
+    function syncKindUi() {
+      hostRow.hidden = kindSelect.value !== "via_ssh";
+    }
+
+    enabledInput.addEventListener("change", () => {
+      row.classList.toggle("is-disabled", !enabledInput.checked);
+      saveDnsSettings();
+    });
+    domainInput.addEventListener("input", () => saveDnsSettings());
+    kindSelect.addEventListener("change", () => {
+      syncKindUi();
+      saveDnsSettings();
+    });
+    nsInput.addEventListener("input", () => saveDnsSettings());
+    portInput.addEventListener("input", () => saveDnsSettings());
+    hostSelect.addEventListener("change", () => saveDnsSettings());
+    removeButton.addEventListener("click", () => {
+      dnsRulesState = readDnsRulesFromDom().filter((item) => item.id !== rule.id);
+      renderDnsRules(dnsRulesState);
+      saveDnsSettings();
+    });
+
+    row.append(enabledInput, domainInput, removeButton, kindRow, serverRow, hostRow);
+    dnsRulesList.append(row);
+  }
+}
+
+function addDnsRule() {
+  const current = readDnsRulesFromDom();
+
+  if (current.length >= MAX_DNS_RULES) {
+    setDnsStatus(`At most ${MAX_DNS_RULES} DNS rules`, true);
+    return;
+  }
+
+  current.push({
+    id: createDnsRuleId(),
+    domain: "",
+    kind: "direct",
+    nameserver: "",
+    nameserverPort: 53,
+    hostAlias: getDefaultHostAlias() || availableHosts[0] || "",
+    enabled: true
+  });
+  renderDnsRules(current);
+  saveDnsSettings(false);
+  dnsRulesList?.querySelector(".dns-rule-row:last-child [data-field='domain']")?.focus();
+}
+
+function setAllDnsRulesEnabled(enabled) {
+  const current = readDnsRulesFromDom();
+
+  if (!current.length) {
+    setDnsStatus("No DNS rules to update", true);
+    return;
+  }
+
+  for (const rule of current) {
+    rule.enabled = enabled;
+  }
+
+  renderDnsRules(current);
+  saveDnsSettings();
+  setDnsStatus(enabled ? "All DNS rules enabled" : "All DNS rules disabled");
+}
+
+function saveDnsSettings(showStatus = true) {
+  clearTimeout(dnsSaveTimer);
+
+  dnsSaveTimer = setTimeout(() => {
+    const settings = collectDnsSettingsFromUi();
+    dnsRulesState = settings.dnsRules;
+
+    chrome.storage.local.set(settings, () => {
+      const error = chrome.runtime.lastError;
+
+      if (error) {
+        setDnsStatus(error.message, true);
+        return;
+      }
+
+      if (showStatus) {
+        setDnsStatus("DNS settings saved");
+      }
+
+      // If DNS session desired, background storage listener will reconcile.
+      chrome.storage.local.get({ sessionDesiredDns: false }, (items) => {
+        if (items.sessionDesiredDns) {
+          sendDnsMessage("dnsReconcile").then((response) => {
+            setDnsConnectButtonState(response?.state === "running" ? "running" : "stopped");
+            if (response && !response.ok) {
+              setDnsStatus(response.message || "DNS reconcile failed", true);
+            }
+          });
+        }
+      });
+    });
+  }, 120);
+}
+
+function sendDnsMessage(action, extra = {}, timeoutMs = 30000) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const waitMs =
+      action === "dnsStart" || action === "dnsInstallResolver" || action === "dnsUninstallResolver"
+        ? Math.max(timeoutMs, 120000)
+        : timeoutMs;
+    const timeout = setTimeout(() => {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      resolve({
+        ok: false,
+        state: "error",
+        message: "Timed out waiting for DNS background response."
+      });
+    }, waitMs);
+
+    const settings = collectDnsSettingsFromUi();
+
+    chrome.runtime.sendMessage(
+      {
+        type: "webhole:dns",
+        action,
+        ...settings,
+        ...extra
+      },
+      (response) => {
+        if (settled) {
+          return;
+        }
+
+        settled = true;
+        clearTimeout(timeout);
+
+        const error = chrome.runtime.lastError;
+
+        if (error) {
+          resolve({ ok: false, state: "error", message: error.message });
+          return;
+        }
+
+        resolve(response || { ok: false, state: "error", message: "Empty DNS response." });
+      }
+    );
+  });
+}
+
+async function refreshDnsStatus() {
+  try {
+    const response = await sendDnsMessage("dnsStatus", {}, 8000);
+    setDnsConnectButtonState(response?.state === "running" ? "running" : "stopped");
+
+    if (response?.state === "running" && response.dns) {
+      setDnsStatus(`DNS running on 127.0.0.1:${response.dns.port}`);
+    } else if (response?.message && response.state === "error") {
+      setDnsStatus(response.message, true);
+    }
+  } catch (error) {
+    setDnsStatus(error.message, true);
+  }
+}
+
+async function connectDns() {
+  const settings = collectDnsSettingsFromUi();
+
+  if (!isValidIpv4(settings.dnsDefaultNameserver)) {
+    setDnsStatus("Default NS must be IPv4", true);
+    return;
+  }
+
+  const complete = settings.dnsRules.filter(
+    (rule) =>
+      rule.enabled &&
+      rule.domain &&
+      DOMAIN_PATTERN_RE.test(rule.domain) &&
+      isValidIpv4(rule.nameserver) &&
+      (rule.kind !== "via_ssh" || isValidHostAlias(rule.hostAlias))
+  );
+
+  // Allow start with zero rules (default-only stub) or with rules.
+  setDnsConnectButtonState("starting");
+  setDnsStatus(complete.length ? `Starting DNS (${complete.length} rules)…` : "Starting DNS (default only)…");
+
+  try {
+    chrome.storage.local.set(settings);
+    const response = await sendDnsMessage("dnsStart");
+    setDnsConnectButtonState(response?.ok && response.state === "running" ? "running" : "stopped");
+    setDnsStatus(response?.message || (response?.ok ? "DNS started" : "DNS start failed"), !response?.ok);
+    appendLog(`DNS On: ${response?.message || response?.state}`);
+  } catch (error) {
+    setDnsConnectButtonState("stopped");
+    setDnsStatus(error.message, true);
+  }
+}
+
+async function disconnectDns() {
+  setDnsConnectButtonState("starting");
+  setDnsStatus("Stopping DNS…");
+
+  try {
+    const response = await sendDnsMessage("dnsStop");
+    setDnsConnectButtonState("stopped");
+    setDnsStatus(response?.message || "DNS stopped", !response?.ok);
+    appendLog(`DNS Off: ${response?.message || response?.state}`);
+  } catch (error) {
+    setDnsConnectButtonState("stopped");
+    setDnsStatus(error.message, true);
+  }
+}
+
+async function queryDnsTest() {
+  const name = normalizeDnsDomain(dnsTestNameInput?.value || "");
+  const type = dnsTestTypeSelect?.value || "A";
+
+  if (!name || !DOMAIN_PATTERN_RE.test(name)) {
+    setDnsStatus("Enter a valid name to query", true);
+    return;
+  }
+
+  setDnsStatus(`Query ${name} ${type}…`);
+
+  try {
+    const response = await sendDnsMessage("dnsQuery", { name, type }, 15000);
+
+    if (!response?.ok) {
+      setDnsStatus(response?.message || "Query failed", true);
+      return;
+    }
+
+    const answers = Array.isArray(response.answers)
+      ? response.answers.map((item) => item.data).join(", ")
+      : "";
+    setDnsStatus(
+      `rcode=${response.rcode} ${answers || "(no answers)"} · ${response.elapsedMs || "?"}ms`
+    );
+  } catch (error) {
+    setDnsStatus(error.message, true);
+  }
+}
+
+async function installDnsResolver() {
+  setDnsStatus("Installing macOS resolver stubs (admin prompt)…");
+  const response = await sendDnsMessage("dnsInstallResolver");
+  setDnsStatus(response?.message || "Install finished", !response?.ok);
+  appendLog(`DNS resolver install: ${response?.message || response?.state}`);
+}
+
+async function uninstallDnsResolver() {
+  setDnsStatus("Uninstalling macOS resolver stubs…");
+  const response = await sendDnsMessage("dnsUninstallResolver");
+  setDnsStatus(response?.message || "Uninstall finished", !response?.ok);
+  appendLog(`DNS resolver uninstall: ${response?.message || response?.state}`);
 }
 
 function collectSettingsFromUi() {
@@ -974,7 +1469,17 @@ function migrateLoadedSettings(items) {
     );
   }
 
-  return { mode, defaultHostAlias, routes, routesFallback };
+  return {
+    mode,
+    defaultHostAlias,
+    routes,
+    routesFallback,
+    dnsListenPort: Number(items.dnsListenPort) || DEFAULT_DNS_LISTEN_PORT,
+    dnsDefaultNameserver: String(items.dnsDefaultNameserver || DEFAULT_DNS_NAMESERVER).trim(),
+    dnsDefaultNameserverPort: Number(items.dnsDefaultNameserverPort) || 53,
+    dnsRules: normalizeDnsRules(items.dnsRules),
+    dnsInstallResolverStubs: Boolean(items.dnsInstallResolverStubs)
+  };
 }
 
 function bootPopup() {
@@ -986,6 +1491,11 @@ function bootPopup() {
       defaultHostAlias: "",
       routes: [],
       routesFallback: DEFAULT_ROUTES_FALLBACK,
+      dnsListenPort: DEFAULT_DNS_LISTEN_PORT,
+      dnsDefaultNameserver: DEFAULT_DNS_NAMESERVER,
+      dnsDefaultNameserverPort: 53,
+      dnsRules: [],
+      dnsInstallResolverStubs: false,
       logs: []
     },
     async (items) => {
@@ -1003,16 +1513,37 @@ function bootPopup() {
         setSelectedMode(migrated.mode);
         setConnectButtonState("disconnected");
         routesState = migrated.routes;
+        dnsRulesState = migrated.dnsRules;
+
+        if (dnsListenPortInput) {
+          dnsListenPortInput.value = String(migrated.dnsListenPort);
+        }
+
+        if (dnsDefaultNameserverInput) {
+          dnsDefaultNameserverInput.value = migrated.dnsDefaultNameserver;
+        }
+
+        if (dnsDefaultNameserverPortInput) {
+          dnsDefaultNameserverPortInput.value = String(migrated.dnsDefaultNameserverPort);
+        }
+
+        if (dnsInstallResolverStubsInput) {
+          dnsInstallResolverStubsInput.checked = migrated.dnsInstallResolverStubs;
+        }
+
         renderLogs(items?.logs);
 
         await refreshTunnelStatus();
+        await refreshDnsStatus();
 
         try {
           await loadHostOptions(migrated.defaultHostAlias, migrated.routes);
+          renderDnsRules(migrated.dnsRules);
         } catch (listError) {
           availableHosts = [];
           populateDefaultHostSelect(migrated.defaultHostAlias);
           renderRoutes(migrated.routes);
+          renderDnsRules(migrated.dnsRules);
           setStatus(listError.message, true);
           appendLog(`List hosts failed: ${listError.message}`);
         }
@@ -1049,6 +1580,19 @@ enableAllRoutesButton?.addEventListener("click", () => setAllRoutesEnabled(true)
 disableAllRoutesButton?.addEventListener("click", () => setAllRoutesEnabled(false));
 connectButton?.addEventListener("click", connectTunnel);
 disconnectButton?.addEventListener("click", disconnectTunnel);
+
+addDnsRuleButton?.addEventListener("click", addDnsRule);
+enableAllDnsButton?.addEventListener("click", () => setAllDnsRulesEnabled(true));
+disableAllDnsButton?.addEventListener("click", () => setAllDnsRulesEnabled(false));
+dnsConnectButton?.addEventListener("click", connectDns);
+dnsDisconnectButton?.addEventListener("click", disconnectDns);
+dnsQueryButton?.addEventListener("click", queryDnsTest);
+dnsInstallResolverButton?.addEventListener("click", installDnsResolver);
+dnsUninstallResolverButton?.addEventListener("click", uninstallDnsResolver);
+dnsListenPortInput?.addEventListener("change", () => saveDnsSettings());
+dnsDefaultNameserverInput?.addEventListener("change", () => saveDnsSettings());
+dnsDefaultNameserverPortInput?.addEventListener("change", () => saveDnsSettings());
+dnsInstallResolverStubsInput?.addEventListener("change", () => saveDnsSettings());
 
 helpToggle?.addEventListener("click", () => {
   helpSection?.classList.toggle("is-open");

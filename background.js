@@ -3,11 +3,16 @@ const LOG_LIMIT = 80;
 const NATIVE_HOST = "com.webhole.host";
 const PROXY_HOST = "127.0.0.1";
 const MAX_ROUTES = 50;
+const MAX_DNS_RULES = 50;
 const HOST_ALIAS_RE = /^[A-Za-z0-9._-]+$/;
 const DOMAIN_PATTERN_RE = /^[a-z0-9._-]+$/;
+const IPV4_RE = /^(?:\d{1,3}\.){3}\d{1,3}$/;
 const VALID_MODES = new Set(["direct", "global", "routes"]);
 const VALID_ROUTES_FALLBACKS = new Set(["direct", "default"]);
+const VALID_DNS_KINDS = new Set(["direct", "via_ssh"]);
 const DEFAULT_ROUTES_FALLBACK = "direct";
+const DEFAULT_DNS_LISTEN_PORT = 53535;
+const DEFAULT_DNS_NAMESERVER = "1.1.1.1";
 const POPUP_PATH = "popup.html";
 const ICONS = {
   connected: {
@@ -168,6 +173,104 @@ function enabledRoutes(routes) {
   return normalizeRoutes(routes).filter((route) => route.enabled);
 }
 
+function isValidIpv4(value) {
+  if (!IPV4_RE.test(String(value || ""))) {
+    return false;
+  }
+
+  return String(value)
+    .split(".")
+    .every((part) => {
+      const n = Number(part);
+      return n >= 0 && n <= 255;
+    });
+}
+
+function createDnsRuleId() {
+  return `d_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function normalizeDnsDomain(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\.$/, "");
+}
+
+function normalizeDnsRules(rules) {
+  const values = Array.isArray(rules) ? rules : [];
+  const seen = new Set();
+  const result = [];
+
+  for (const rule of values) {
+    if (!rule || typeof rule !== "object") {
+      continue;
+    }
+
+    const domain = normalizeDnsDomain(rule.domain);
+    const kind = VALID_DNS_KINDS.has(rule.kind) ? rule.kind : "direct";
+    const nameserver = String(rule.nameserver || "").trim();
+    const nameserverPort = Number(rule.nameserverPort) || 53;
+    const hostAlias = normalizeHostAlias(rule.hostAlias);
+    const enabled = rule.enabled !== false;
+
+    if (!domain || !DOMAIN_PATTERN_RE.test(domain) || !isValidIpv4(nameserver)) {
+      // Keep incomplete rows only if they have an id (UI drafting) — drop for native payload later.
+      if (!rule.id) {
+        continue;
+      }
+    }
+
+    if (kind === "via_ssh" && hostAlias && !isValidHostAlias(hostAlias)) {
+      continue;
+    }
+
+    if (!Number.isInteger(nameserverPort) || nameserverPort < 1 || nameserverPort > 65535) {
+      continue;
+    }
+
+    const key = `${rule.id || ""}\0${domain}\0${kind}\0${nameserver}\0${nameserverPort}\0${hostAlias}`;
+
+    if (seen.has(key)) {
+      continue;
+    }
+
+    seen.add(key);
+    result.push({
+      id: String(rule.id || createDnsRuleId()),
+      domain,
+      kind,
+      nameserver,
+      nameserverPort,
+      hostAlias: kind === "via_ssh" ? hostAlias : "",
+      enabled
+    });
+
+    if (result.length >= MAX_DNS_RULES) {
+      break;
+    }
+  }
+
+  result.sort((a, b) => (b.domain || "").length - (a.domain || "").length);
+  return result;
+}
+
+function enabledDnsRules(rules) {
+  return normalizeDnsRules(rules).filter(
+    (rule) =>
+      rule.enabled &&
+      rule.domain &&
+      DOMAIN_PATTERN_RE.test(rule.domain) &&
+      isValidIpv4(rule.nameserver) &&
+      (rule.kind !== "via_ssh" || isValidHostAlias(rule.hostAlias))
+  );
+}
+
+function normalizeDnsListenPort(value) {
+  const port = Number(value);
+  return Number.isInteger(port) && port >= 1 && port <= 65535 ? port : DEFAULT_DNS_LISTEN_PORT;
+}
+
 function migrateSettings(items) {
   const mode = normalizeMode(items.mode);
   const defaultHostAlias = normalizeHostAlias(items.defaultHostAlias || items.hostAlias || "");
@@ -183,13 +286,28 @@ function migrateSettings(items) {
     );
   }
 
+  const defaultNameserver = isValidIpv4(items.dnsDefaultNameserver)
+    ? String(items.dnsDefaultNameserver).trim()
+    : DEFAULT_DNS_NAMESERVER;
+  const defaultNameserverPort = Number(items.dnsDefaultNameserverPort) || 53;
+
   return {
     mode,
     defaultHostAlias,
     routes,
     hostAlias: defaultHostAlias,
     sessionDesired: Boolean(items.sessionDesired),
-    routesFallback: normalizeRoutesFallback(items.routesFallback)
+    routesFallback: normalizeRoutesFallback(items.routesFallback),
+    dnsEnabled: Boolean(items.dnsEnabled),
+    sessionDesiredDns: Boolean(items.sessionDesiredDns),
+    dnsListenPort: normalizeDnsListenPort(items.dnsListenPort),
+    dnsDefaultNameserver: defaultNameserver,
+    dnsDefaultNameserverPort:
+      Number.isInteger(defaultNameserverPort) && defaultNameserverPort >= 1 && defaultNameserverPort <= 65535
+        ? defaultNameserverPort
+        : 53,
+    dnsRules: normalizeDnsRules(items.dnsRules),
+    dnsInstallResolverStubs: Boolean(items.dnsInstallResolverStubs)
   };
 }
 
@@ -466,21 +584,30 @@ function getStoredSettings() {
         defaultHostAlias: "",
         routes: [],
         sessionDesired: false,
-        routesFallback: DEFAULT_ROUTES_FALLBACK
+        routesFallback: DEFAULT_ROUTES_FALLBACK,
+        dnsEnabled: false,
+        sessionDesiredDns: false,
+        dnsListenPort: DEFAULT_DNS_LISTEN_PORT,
+        dnsDefaultNameserver: DEFAULT_DNS_NAMESERVER,
+        dnsDefaultNameserverPort: 53,
+        dnsRules: [],
+        dnsInstallResolverStubs: false
       },
       (items) => {
         const error = chrome.runtime.lastError;
 
         if (error) {
           console.error(`Webhole settings load failed: ${error.message}`);
-          resolve({
-            mode: DEFAULT_MODE,
-            defaultHostAlias: "",
-            routes: [],
-            hostAlias: "",
-            sessionDesired: false,
-            routesFallback: DEFAULT_ROUTES_FALLBACK
-          });
+          resolve(
+            migrateSettings({
+              mode: DEFAULT_MODE,
+              defaultHostAlias: "",
+              routes: [],
+              hostAlias: "",
+              sessionDesired: false,
+              routesFallback: DEFAULT_ROUTES_FALLBACK
+            })
+          );
           return;
         }
 
@@ -488,6 +615,15 @@ function getStoredSettings() {
       }
     );
   });
+}
+
+function buildDnsNativePayload(settings) {
+  return {
+    listenPort: settings.dnsListenPort || DEFAULT_DNS_LISTEN_PORT,
+    defaultNameserver: settings.dnsDefaultNameserver || DEFAULT_DNS_NAMESERVER,
+    defaultNameserverPort: settings.dnsDefaultNameserverPort || 53,
+    rules: enabledDnsRules(settings.dnsRules)
+  };
 }
 
 function setDirectMode() {
@@ -511,7 +647,13 @@ const NATIVE_TIMEOUT_MS = {
   listHosts: 8000,
   disconnect: 20000,
   connect: 120000,
-  reconcile: 120000
+  reconcile: 120000,
+  dnsStart: 120000,
+  dnsStop: 20000,
+  dnsStatus: 8000,
+  dnsQuery: 15000,
+  dnsInstallResolver: 120000,
+  dnsUninstallResolver: 120000
 };
 
 function sendNativeMessage(message) {
@@ -919,11 +1061,176 @@ async function handleTunnelMessage(message) {
 /** Independent popup window (survives Chrome action-popup focus bugs). */
 let webholeWindowId = null;
 
+let dnsReconcileTimer = 0;
+let dnsReconcileInFlight = false;
+let pendingDnsReconcile = false;
+
+async function reconcileDnsSessionFromSettings() {
+  if (dnsReconcileInFlight) {
+    pendingDnsReconcile = true;
+    return sendNativeMessage({ action: "dnsStatus" });
+  }
+
+  dnsReconcileInFlight = true;
+
+  try {
+    const settings = await getStoredSettings();
+    const desired = Boolean(settings.sessionDesiredDns) && Boolean(settings.dnsEnabled);
+
+    if (!desired) {
+      const status = await sendNativeMessage({ action: "dnsStatus" });
+
+      if (status?.state === "running") {
+        appendLog("Background DNS reconcile: stopping");
+        return sendNativeMessage({ action: "dnsStop" });
+      }
+
+      return status || { ok: true, state: "stopped", dns: null };
+    }
+
+    const payload = buildDnsNativePayload(settings);
+    appendLog(
+      `Background DNS reconcile start: port=${payload.listenPort} rules=${payload.rules.length}`
+    );
+
+    const response = await sendNativeMessage({
+      action: "dnsStart",
+      ...payload
+    });
+
+    if (response?.ok) {
+      appendLog(response.message || "DNS started");
+    } else {
+      appendLog(`DNS start failed: ${response?.message || "unknown"}`);
+    }
+
+    return response;
+  } finally {
+    dnsReconcileInFlight = false;
+
+    if (pendingDnsReconcile) {
+      pendingDnsReconcile = false;
+      setTimeout(() => {
+        reconcileDnsSessionFromSettings().catch((error) => {
+          appendLog(`DNS reconcile failed: ${error.message}`);
+        });
+      }, 0);
+    }
+  }
+}
+
+function scheduleReconcileDnsSession() {
+  if (dnsReconcileInFlight) {
+    pendingDnsReconcile = true;
+    return;
+  }
+
+  clearTimeout(dnsReconcileTimer);
+  dnsReconcileTimer = setTimeout(() => {
+    reconcileDnsSessionFromSettings().catch((error) => {
+      console.error(`Webhole DNS reconcile failed: ${error.message}`);
+      appendLog(`DNS reconcile failed: ${error.message}`);
+    });
+  }, 350);
+}
+
+async function handleDnsMessage(message) {
+  const settings = await getStoredSettings();
+  const next = {
+    ...settings,
+    dnsEnabled: message.dnsEnabled != null ? Boolean(message.dnsEnabled) : settings.dnsEnabled,
+    sessionDesiredDns:
+      message.sessionDesiredDns != null ? Boolean(message.sessionDesiredDns) : settings.sessionDesiredDns,
+    dnsListenPort:
+      message.dnsListenPort != null ? normalizeDnsListenPort(message.dnsListenPort) : settings.dnsListenPort,
+    dnsDefaultNameserver:
+      message.dnsDefaultNameserver != null
+        ? isValidIpv4(message.dnsDefaultNameserver)
+          ? String(message.dnsDefaultNameserver).trim()
+          : settings.dnsDefaultNameserver
+        : settings.dnsDefaultNameserver,
+    dnsDefaultNameserverPort:
+      message.dnsDefaultNameserverPort != null
+        ? Number(message.dnsDefaultNameserverPort) || settings.dnsDefaultNameserverPort
+        : settings.dnsDefaultNameserverPort,
+    dnsRules: message.dnsRules != null ? normalizeDnsRules(message.dnsRules) : settings.dnsRules,
+    dnsInstallResolverStubs:
+      message.dnsInstallResolverStubs != null
+        ? Boolean(message.dnsInstallResolverStubs)
+        : settings.dnsInstallResolverStubs
+  };
+
+  if (message.action === "dnsStatus") {
+    return sendNativeMessage({ action: "dnsStatus" });
+  }
+
+  if (message.action === "dnsReconcile") {
+    clearTimeout(dnsReconcileTimer);
+    return reconcileDnsSessionFromSettings();
+  }
+
+  if (message.action === "dnsStart") {
+    await saveSettings({
+      dnsEnabled: true,
+      sessionDesiredDns: true,
+      dnsListenPort: next.dnsListenPort,
+      dnsDefaultNameserver: next.dnsDefaultNameserver,
+      dnsDefaultNameserverPort: next.dnsDefaultNameserverPort,
+      dnsRules: next.dnsRules
+    });
+
+    const payload = buildDnsNativePayload({
+      ...next,
+      dnsEnabled: true
+    });
+
+    appendLog(`Background DNS On: rules=${payload.rules.length}`);
+    return sendNativeMessage({ action: "dnsStart", ...payload });
+  }
+
+  if (message.action === "dnsStop") {
+    await saveSettings({ sessionDesiredDns: false, dnsEnabled: false });
+    appendLog("Background DNS Off");
+    return sendNativeMessage({ action: "dnsStop" });
+  }
+
+  if (message.action === "dnsQuery") {
+    return sendNativeMessage({
+      action: "dnsQuery",
+      name: message.name,
+      type: message.type || "A"
+    });
+  }
+
+  if (message.action === "dnsInstallResolver") {
+    const payload = buildDnsNativePayload(next);
+    await saveSettings({ dnsInstallResolverStubs: true });
+    return sendNativeMessage({
+      action: "dnsInstallResolver",
+      ...payload
+    });
+  }
+
+  if (message.action === "dnsUninstallResolver") {
+    await saveSettings({ dnsInstallResolverStubs: false });
+    return sendNativeMessage({ action: "dnsUninstallResolver" });
+  }
+
+  return {
+    ok: false,
+    state: "error",
+    message: "Unknown DNS action."
+  };
+}
+
 function scheduleStartupSync() {
   // Defer so SW install/startup is not blocked by native messaging.
   setTimeout(() => {
     syncTunnelAndProxy().catch((error) => {
       appendLog(`Startup sync failed: ${error instanceof Error ? error.message : String(error)}`);
+    });
+    reconcileDnsSessionFromSettings().catch((error) => {
+      appendLog(`Startup DNS sync failed: ${error instanceof Error ? error.message : String(error)}`);
     });
   }, 0);
 }
@@ -986,6 +1293,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
+  if (message.type === "webhole:dns") {
+    handleDnsMessage(message).then(sendResponse);
+    return true;
+  }
+
   if (message.type !== "webhole:tunnel") {
     return false;
   }
@@ -1014,17 +1326,26 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
   }
 
   if (
-    !changes.mode &&
-    !changes.routes &&
-    !changes.defaultHostAlias &&
-    !changes.hostAlias &&
-    !changes.sessionDesired &&
-    !changes.routesFallback
+    changes.mode ||
+    changes.routes ||
+    changes.defaultHostAlias ||
+    changes.hostAlias ||
+    changes.sessionDesired ||
+    changes.routesFallback
   ) {
-    return;
+    scheduleReconcileSession();
   }
 
-  scheduleReconcileSession();
+  if (
+    changes.dnsEnabled ||
+    changes.sessionDesiredDns ||
+    changes.dnsRules ||
+    changes.dnsListenPort ||
+    changes.dnsDefaultNameserver ||
+    changes.dnsDefaultNameserverPort
+  ) {
+    scheduleReconcileDnsSession();
+  }
 });
 
 ensureActionPopup();

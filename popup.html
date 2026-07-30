@@ -374,9 +374,133 @@
         font-size: 11px;
       }
 
-      #routesList {
+      #routesList,
+      #dnsRulesList {
         display: grid;
         gap: 6px;
+      }
+
+      /* —— DNS —— */
+      .dns-panel {
+        display: grid;
+        gap: 10px;
+      }
+
+      .dns-toolbar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+      }
+
+      .dns-toolbar strong {
+        font-size: 13px;
+      }
+
+      .dns-actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        align-items: center;
+      }
+
+      .dns-meta {
+        display: grid;
+        gap: 8px;
+      }
+
+      .dns-meta-row {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 8px;
+      }
+
+      .dns-meta-row label {
+        display: grid;
+        gap: 4px;
+        font-size: 11px;
+        color: var(--muted);
+      }
+
+      .dns-meta-row input,
+      .dns-meta-row select {
+        width: 100%;
+      }
+
+      .dns-rule-row {
+        display: grid;
+        grid-template-columns: auto 1fr auto;
+        grid-template-areas:
+          "enabled domain remove"
+          ". kind kind"
+          ". server server"
+          ". host host";
+        gap: 6px 8px;
+        align-items: center;
+        padding: 10px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--surface-soft);
+        border-left: 3px solid #0ea5e9;
+      }
+
+      .dns-rule-row.is-disabled {
+        opacity: 0.55;
+        border-left-color: #94a3b8;
+      }
+
+      .dns-rule-row [data-field="enabled"] {
+        grid-area: enabled;
+      }
+
+      .dns-rule-row [data-field="domain"] {
+        grid-area: domain;
+      }
+
+      .dns-rule-row .dns-remove {
+        grid-area: remove;
+      }
+
+      .dns-rule-row .dns-kind-row {
+        grid-area: kind;
+        display: flex;
+        gap: 8px;
+        align-items: center;
+      }
+
+      .dns-rule-row .dns-server-row {
+        grid-area: server;
+        display: grid;
+        grid-template-columns: 1fr 72px;
+        gap: 6px;
+      }
+
+      .dns-rule-row .dns-host-row {
+        grid-area: host;
+        display: flex;
+        gap: 6px;
+        align-items: center;
+      }
+
+      .dns-rule-row .dns-host-row[hidden] {
+        display: none;
+      }
+
+      .dns-test-row {
+        display: grid;
+        grid-template-columns: 1fr 72px auto;
+        gap: 6px;
+        align-items: center;
+      }
+
+      .dns-status {
+        font-size: 11px;
+        color: var(--muted);
+        word-break: break-word;
+      }
+
+      .dns-status.is-error {
+        color: var(--danger, #dc2626);
       }
 
       .route-row {
@@ -641,6 +765,65 @@
       <div class="hint">Pattern：<code>host</code> 或 <code>host/path</code>。勾選啟用；via = SOCKS 出口。較長 path 優先。</div>
     </section>
 
+    <!-- DNS (independent of proxy mode) -->
+    <section class="panel dns-panel" id="dnsSection">
+      <div class="dns-toolbar">
+        <strong>Split DNS</strong>
+        <div class="dns-actions">
+          <button class="link-button" id="enableAllDnsButton" type="button">All on</button>
+          <button class="link-button" id="disableAllDnsButton" type="button">All off</button>
+          <button class="link-button" id="addDnsRuleButton" type="button">+ Add</button>
+          <button id="dnsConnectButton" class="connect-button is-disconnected" type="button">DNS On</button>
+          <button id="dnsDisconnectButton" type="button">Off</button>
+        </div>
+      </div>
+
+      <div class="dns-meta">
+        <div class="dns-meta-row">
+          <label>
+            Listen port
+            <input id="dnsListenPort" type="number" min="1" max="65535" value="53535" spellcheck="false">
+          </label>
+          <label>
+            Default NS
+            <input id="dnsDefaultNameserver" type="text" value="1.1.1.1" placeholder="1.1.1.1" spellcheck="false" autocomplete="off">
+          </label>
+        </div>
+        <div class="dns-meta-row">
+          <label>
+            Default port
+            <input id="dnsDefaultNameserverPort" type="number" min="1" max="65535" value="53">
+          </label>
+          <label style="align-content: end;">
+            <span style="display:flex;gap:6px;align-items:center;min-height:32px;">
+              <input id="dnsInstallResolverStubs" type="checkbox">
+              macOS /etc/resolver stubs
+            </span>
+          </label>
+        </div>
+      </div>
+
+      <div id="dnsRulesList"></div>
+      <div class="hint">Domain suffix → Direct nameserver 或 Via SSH（<code>ssh -L</code> 到遠端 DNS）。較長 domain 優先。與 Routes 正交。</div>
+
+      <div class="dns-test-row">
+        <input id="dnsTestName" type="text" placeholder="name.corp.example.com" spellcheck="false" autocomplete="off">
+        <select id="dnsTestType" aria-label="Query type">
+          <option value="A">A</option>
+          <option value="AAAA">AAAA</option>
+          <option value="CNAME">CNAME</option>
+          <option value="MX">MX</option>
+          <option value="TXT">TXT</option>
+        </select>
+        <button id="dnsQueryButton" type="button">Query</button>
+      </div>
+      <div class="dns-status" id="dnsStatus" role="status"></div>
+      <div class="dns-actions">
+        <button class="link-button" id="dnsInstallResolverButton" type="button">Install resolver</button>
+        <button class="link-button" id="dnsUninstallResolverButton" type="button">Uninstall resolver</button>
+      </div>
+    </section>
+
     <!-- SECONDARY -->
     <section class="panel help" id="helpSection">
       <strong>操作說明</strong>
@@ -651,6 +834,7 @@
         <li><strong>Routes</strong>：Host 可空白；只開已啟用規則的出口；未匹配預設本機</li>
         <li>未匹配選 Default 時，上方 Host 才會作為兜底出口</li>
         <li>Pattern 可寫 <code>example.com</code> 或 <code>example.com/api</code></li>
+        <li><strong>Split DNS</strong>：依 domain 選 nameserver（本機 stub <code>127.0.0.1:53535</code>）；與 proxy 獨立</li>
         <li>Popup 不穩時用「視窗」或 <code>⌥⇧W</code></li>
       </ol>
     </section>

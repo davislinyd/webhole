@@ -1,0 +1,94 @@
+<svg width="960" height="520" viewBox="0 0 960 520" role="img" aria-labelledby="webhole-flow-title webhole-flow-desc" xmlns="http://www.w3.org/2000/svg">
+  <title id="webhole-flow-title">Webhole SSH SOCKS5 tunnel flow</title>
+  <desc id="webhole-flow-desc">Flowchart showing the Webhole popup sending tunnel commands to the background service worker, the native host starting ssh dynamic forwarding, and Chrome proxy settings routing traffic through SOCKS5.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#2563eb" />
+    </marker>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="125%">
+      <feDropShadow dx="0" dy="8" stdDeviation="8" flood-color="#0f172a" flood-opacity="0.12"/>
+    </filter>
+    <style>
+      .bg { fill: #f8fafc; }
+      .card { fill: #ffffff; stroke: #cbd5e1; stroke-width: 1.4; filter: url(#shadow); }
+      .card-primary { fill: #eff6ff; stroke: #60a5fa; }
+      .card-native { fill: #f0fdf4; stroke: #4ade80; }
+      .card-ssh { fill: #fff7ed; stroke: #fb923c; }
+      .card-store { fill: #f8fafc; stroke: #94a3b8; stroke-dasharray: 5 4; }
+      .title { fill: #0f172a; font: 700 18px Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .label { fill: #0f172a; font: 700 15px Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .small { fill: #475569; font: 12px Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .edge { stroke: #2563eb; stroke-width: 2.4; fill: none; marker-end: url(#arrow); }
+      .edge-muted { stroke: #64748b; stroke-width: 2; fill: none; marker-end: url(#arrow); stroke-dasharray: 6 5; }
+      .edge-label { fill: #1d4ed8; font: 12px Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    </style>
+  </defs>
+
+  <rect class="bg" width="960" height="520" rx="24" />
+  <text class="title" x="40" y="48">Webhole Flow</text>
+  <text class="small" x="40" y="70">Chrome extension controls a local SSH dynamic forwarding tunnel and applies browser proxy settings.</text>
+
+  <rect class="card card-primary" x="40" y="130" width="150" height="86" rx="16" />
+  <text class="label" x="74" y="165">User</text>
+  <text class="small" x="66" y="188">presses On</text>
+
+  <rect class="card" x="245" y="112" width="180" height="122" rx="16" />
+  <text class="label" x="285" y="150">Popup UI</text>
+  <text class="small" x="272" y="174">popup.html / popup.js</text>
+  <text class="small" x="272" y="194">host alias, mode, domains</text>
+
+  <rect class="card" x="490" y="112" width="190" height="122" rx="16" />
+  <text class="label" x="522" y="150">Background</text>
+  <text class="small" x="520" y="174">background.js</text>
+  <text class="small" x="520" y="194">native messaging + proxy</text>
+
+  <rect class="card card-native" x="745" y="112" width="175" height="122" rx="16" />
+  <text class="label" x="781" y="150">Native Host</text>
+  <text class="small" x="779" y="174">native-host/host.js</text>
+  <text class="small" x="779" y="194">validates + spawns ssh</text>
+
+  <rect class="card card-ssh" x="548" y="330" width="205" height="98" rx="16" />
+  <text class="label" x="592" y="368">SSH SOCKS5</text>
+  <text class="small" x="580" y="392">ssh -D 127.0.0.1:1080</text>
+
+  <rect class="card card-store" x="285" y="330" width="190" height="98" rx="16" />
+  <text class="label" x="324" y="368">Local State</text>
+  <text class="small" x="315" y="392">state.json / ssh.log</text>
+
+  <rect class="card card-store" x="52" y="330" width="178" height="98" rx="16" />
+  <text class="label" x="82" y="368">Chrome Storage</text>
+  <text class="small" x="87" y="392">settings + logs</text>
+
+  <path class="edge" d="M 190 173 L 236 173" />
+  <text class="edge-label" x="204" y="158">On</text>
+
+  <path class="edge" d="M 425 173 L 481 173" />
+  <text class="edge-label" x="432" y="158">sendMessage</text>
+
+  <path class="edge" d="M 680 173 L 736 173" />
+  <text class="edge-label" x="688" y="158">connect</text>
+
+  <path class="edge" d="M 810 234 C 800 292 755 330 730 354" />
+  <text class="edge-label" x="770" y="298">spawn ssh</text>
+
+  <path class="edge-muted" d="M 745 385 L 762 385 C 885 385 895 219 895 219" />
+  <text class="edge-label" x="780" y="405">status: connected / error</text>
+
+  <path class="edge" d="M 587 234 C 585 272 610 303 631 323" />
+  <text class="edge-label" x="604" y="285">apply proxy</text>
+
+  <path class="edge-muted" d="M 548 385 L 484 385" />
+  <text class="edge-label" x="494" y="370">write runtime</text>
+
+  <path class="edge-muted" d="M 245 203 C 190 242 158 288 145 321" />
+  <text class="edge-label" x="151" y="275">save logs</text>
+
+  <path class="edge-muted" d="M 490 207 C 380 256 260 297 214 325" />
+  <text class="edge-label" x="306" y="284">settings / logs</text>
+
+  <path class="edge-muted" d="M 503 206 C 454 252 419 293 397 322" />
+  <text class="edge-label" x="418" y="279">mode + domains</text>
+
+  <rect x="490" y="454" width="430" height="34" rx="17" fill="#e0f2fe" stroke="#38bdf8" />
+  <text class="small" x="514" y="476">Proxy modes: direct clears proxy · global routes all traffic · auto routes matching domains through SOCKS5</text>
+</svg>

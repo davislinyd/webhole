@@ -8,9 +8,16 @@ const path = require("path");
 const { execFile, spawn } = require("child_process");
 
 const HOST_ALIAS_RE = /^[A-Za-z0-9._-]+$/;
+const DOMAIN_RE = /^[a-z0-9._-]+$/;
+const IPV4_RE = /^(?:\d{1,3}\.){3}\d{1,3}$/;
 const PROXY_HOST = "127.0.0.1";
 const BASE_PORT = 1080;
+// Avoid 5353 (often used by mDNSResponder on macOS).
+const DNS_DEFAULT_PORT = 53535;
+const DNS_FORWARD_BASE_PORT = 15353;
 const MAX_TUNNELS = 8;
+const MAX_DNS_RULES = 50;
+const MAX_DNS_FORWARDS = 16;
 const MAX_INCLUDE_DEPTH = 16;
 // ProxyCommand / jump hosts often need longer than a few seconds.
 const TUNNEL_READY_TIMEOUT_MS = 30000;
@@ -19,7 +26,12 @@ const SSH_STDERR_LIMIT = 4000;
 const RUNTIME_DIR = path.join(__dirname, "runtime");
 const STATE_FILE = path.join(RUNTIME_DIR, "state.json");
 const SSH_LOG_FILE = path.join(RUNTIME_DIR, "ssh.log");
+const DNS_LOG_FILE = path.join(RUNTIME_DIR, "dns.log");
+const DNS_CONFIG_FILE = path.join(RUNTIME_DIR, "dns-config.json");
+const DNS_RESOLVER_MANIFEST = path.join(RUNTIME_DIR, "resolver-files.json");
+const DNS_DAEMON_SCRIPT = path.join(__dirname, "dns-daemon.js");
 const DEFAULT_SSH_CONFIG = path.join(os.homedir(), ".ssh", "config");
+const RESOLVER_DIR = "/etc/resolver";
 
 function ensureRuntimeDir() {
   fs.mkdirSync(RUNTIME_DIR, { recursive: true, mode: 0o700 });
@@ -33,14 +45,60 @@ function readRawState() {
   }
 }
 
-function normalizeState(raw) {
-  if (!raw || typeof raw !== "object") {
-    return { tunnels: {} };
+function normalizeDnsState(rawDns) {
+  if (!rawDns || typeof rawDns !== "object") {
+    return null;
   }
 
-  if (raw.tunnels && typeof raw.tunnels === "object") {
-    const tunnels = {};
+  const pid = Number(rawDns.pid);
+  const port = Number(rawDns.port);
 
+  if (!Number.isInteger(pid) || pid <= 0 || !Number.isInteger(port) || port < 1) {
+    return null;
+  }
+
+  const forwards = {};
+
+  if (rawDns.forwards && typeof rawDns.forwards === "object") {
+    for (const [key, entry] of Object.entries(rawDns.forwards)) {
+      if (!entry || typeof entry !== "object") {
+        continue;
+      }
+
+      const fPid = Number(entry.pid);
+      const localPort = Number(entry.localPort);
+
+      if (!Number.isInteger(fPid) || fPid <= 0 || !Number.isInteger(localPort) || localPort < 1) {
+        continue;
+      }
+
+      forwards[key] = {
+        pid: fPid,
+        localPort,
+        hostAlias: String(entry.hostAlias || ""),
+        remoteDns: String(entry.remoteDns || ""),
+        remotePort: Number(entry.remotePort) || 53,
+        startedAt: entry.startedAt || ""
+      };
+    }
+  }
+
+  return {
+    pid,
+    port,
+    startedAt: rawDns.startedAt || "",
+    forwards
+  };
+}
+
+function normalizeState(raw) {
+  if (!raw || typeof raw !== "object") {
+    return { tunnels: {}, dns: null };
+  }
+
+  const tunnels = {};
+
+  if (raw.tunnels && typeof raw.tunnels === "object") {
     for (const [hostAlias, entry] of Object.entries(raw.tunnels)) {
       if (!entry || typeof entry !== "object") {
         continue;
@@ -59,45 +117,58 @@ function normalizeState(raw) {
         startedAt: entry.startedAt || ""
       };
     }
-
-    return { tunnels };
-  }
-
-  // Legacy single-tunnel state.
-  if (raw.pid && raw.hostAlias) {
+  } else if (raw.pid && raw.hostAlias) {
+    // Legacy single-tunnel state.
     const hostAlias = String(raw.hostAlias);
     const pid = Number(raw.pid);
 
     if (HOST_ALIAS_RE.test(hostAlias) && Number.isInteger(pid)) {
-      return {
-        tunnels: {
-          [hostAlias]: {
-            pid,
-            port: BASE_PORT,
-            startedAt: raw.startedAt || ""
-          }
-        }
+      tunnels[hostAlias] = {
+        pid,
+        port: BASE_PORT,
+        startedAt: raw.startedAt || ""
       };
     }
   }
 
-  return { tunnels: {} };
+  return {
+    tunnels,
+    dns: normalizeDnsState(raw.dns)
+  };
 }
 
 function readState() {
   return normalizeState(readRawState());
 }
 
-function writeState(state) {
+function writeState(partial) {
   ensureRuntimeDir();
-  const tunnels = state.tunnels && typeof state.tunnels === "object" ? state.tunnels : {};
+  const current = readState();
+  const tunnels =
+    partial && Object.prototype.hasOwnProperty.call(partial, "tunnels")
+      ? partial.tunnels && typeof partial.tunnels === "object"
+        ? partial.tunnels
+        : {}
+      : current.tunnels;
+  const dns = partial && Object.prototype.hasOwnProperty.call(partial, "dns")
+    ? normalizeDnsState(partial.dns)
+    : current.dns;
 
-  if (Object.keys(tunnels).length === 0) {
+  const hasTunnels = Object.keys(tunnels).length > 0;
+  const hasDns = Boolean(dns);
+
+  if (!hasTunnels && !hasDns) {
     clearState();
     return;
   }
 
-  fs.writeFileSync(STATE_FILE, JSON.stringify({ tunnels }, null, 2));
+  const payload = { tunnels };
+
+  if (hasDns) {
+    payload.dns = dns;
+  }
+
+  fs.writeFileSync(STATE_FILE, JSON.stringify(payload, null, 2));
 }
 
 function appendSshLog(message) {
@@ -279,7 +350,7 @@ async function reconcileState() {
   }
 
   writeState({ tunnels: nextTunnels });
-  return { tunnels: nextTunnels, reports, hasError };
+  return { tunnels: nextTunnels, dns: readState().dns, reports, hasError };
 }
 
 function aggregateState(reports) {
@@ -709,8 +780,960 @@ async function disconnectAll() {
     await disconnectHost(hostAlias, entry);
   }
 
-  clearState();
+  // Keep DNS session independent of SOCKS disconnect.
+  writeState({ tunnels: {}, dns: state.dns });
   return { ok: true, state: "disconnected", tunnels: [] };
+}
+
+function appendDnsLog(message) {
+  ensureRuntimeDir();
+  fs.appendFileSync(DNS_LOG_FILE, `[${new Date().toISOString()}] ${message}\n`);
+}
+
+function isValidIpv4(value) {
+  if (!IPV4_RE.test(value)) {
+    return false;
+  }
+
+  return value.split(".").every((part) => {
+    const n = Number(part);
+    return n >= 0 && n <= 255;
+  });
+}
+
+function normalizeDnsDomain(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\.$/, "");
+}
+
+function normalizeDnsMessageConfig(message) {
+  const listenPort = Number(message.listenPort) || DNS_DEFAULT_PORT;
+  const defaultNs = String(message.defaultNameserver || message.defaultUpstream?.nameserver || "1.1.1.1").trim();
+  const defaultPort = Number(message.defaultNameserverPort || message.defaultUpstream?.nameserverPort) || 53;
+  const rulesIn = Array.isArray(message.rules) ? message.rules : [];
+  const rules = [];
+  const seen = new Set();
+
+  for (const rule of rulesIn) {
+    if (!rule || typeof rule !== "object" || rule.enabled === false) {
+      continue;
+    }
+
+    const domain = normalizeDnsDomain(rule.domain);
+    const kind = rule.kind === "via_ssh" ? "via_ssh" : "direct";
+    const nameserver = String(rule.nameserver || "").trim();
+    const nameserverPort = Number(rule.nameserverPort) || 53;
+    const hostAlias = String(rule.hostAlias || "").trim();
+
+    if (!domain || !DOMAIN_RE.test(domain) || !isValidIpv4(nameserver)) {
+      continue;
+    }
+
+    if (!Number.isInteger(nameserverPort) || nameserverPort < 1 || nameserverPort > 65535) {
+      continue;
+    }
+
+    if (kind === "via_ssh") {
+      if (!HOST_ALIAS_RE.test(hostAlias)) {
+        continue;
+      }
+    }
+
+    const key = `${domain}\0${kind}\0${nameserver}\0${nameserverPort}\0${hostAlias}`;
+
+    if (seen.has(key)) {
+      continue;
+    }
+
+    seen.add(key);
+    rules.push({
+      id: String(rule.id || `d_${domain}`),
+      enabled: true,
+      domain,
+      kind,
+      nameserver,
+      nameserverPort,
+      hostAlias: kind === "via_ssh" ? hostAlias : ""
+    });
+
+    if (rules.length >= MAX_DNS_RULES) {
+      break;
+    }
+  }
+
+  rules.sort((a, b) => b.domain.length - a.domain.length);
+
+  if (!isValidIpv4(defaultNs) || !Number.isInteger(listenPort) || listenPort < 1 || listenPort > 65535) {
+    return {
+      ok: false,
+      message: "Invalid DNS listen port or default nameserver (IPv4 required)."
+    };
+  }
+
+  return {
+    ok: true,
+    config: {
+      listenHost: PROXY_HOST,
+      listenPort,
+      defaultUpstream: {
+        nameserver: defaultNs,
+        nameserverPort: defaultPort
+      },
+      rules
+    }
+  };
+}
+
+function forwardKey(hostAlias, remoteDns, remotePort) {
+  return `${hostAlias}|${remoteDns}|${remotePort}`;
+}
+
+async function isRecordedDnsForwardProcess(pid, localPort, hostAlias) {
+  const command = await readProcessCommand(pid);
+
+  return (
+    command.includes("ssh") &&
+    command.includes("-N") &&
+    command.includes("-L") &&
+    command.includes(`${PROXY_HOST}:${localPort}:`) &&
+    command.includes(hostAlias)
+  );
+}
+
+async function isRecordedDnsDaemon(pid) {
+  const command = await readProcessCommand(pid);
+  return command.includes("dns-daemon.js") || command.includes("dns-daemon");
+}
+
+async function stopProcess(pid) {
+  await stopTunnelProcess(pid);
+}
+
+function usedForwardPorts(forwards) {
+  return new Set(Object.values(forwards || {}).map((entry) => entry.localPort));
+}
+
+function allocateForwardPort(forwards) {
+  const taken = usedForwardPorts(forwards);
+
+  for (let offset = 0; offset < MAX_DNS_FORWARDS * 4; offset += 1) {
+    const port = DNS_FORWARD_BASE_PORT + offset;
+
+    if (!taken.has(port)) {
+      return port;
+    }
+  }
+
+  return null;
+}
+
+async function spawnDnsForward(hostAlias, remoteDns, remotePort, localPort) {
+  ensureRuntimeDir();
+  appendDnsLog(
+    `starting dns forward ${PROXY_HOST}:${localPort} -> ${remoteDns}:${remotePort} via ${hostAlias}`
+  );
+
+  let stderrBuf = "";
+  const child = spawn(
+    "ssh",
+    [
+      "-N",
+      "-n",
+      "-L",
+      `${PROXY_HOST}:${localPort}:${remoteDns}:${remotePort}`,
+      "-o",
+      "ControlMaster=no",
+      "-o",
+      "ControlPath=none",
+      "-o",
+      "ExitOnForwardFailure=yes",
+      "-o",
+      "BatchMode=yes",
+      "-o",
+      "ConnectTimeout=20",
+      "-o",
+      "ServerAliveInterval=30",
+      "-o",
+      "ServerAliveCountMax=3",
+      hostAlias
+    ],
+    {
+      detached: true,
+      stdio: ["ignore", "ignore", "pipe"]
+    }
+  );
+
+  if (child.stderr) {
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk) => {
+      stderrBuf += String(chunk);
+    });
+  }
+
+  child.once("error", (error) => {
+    stderrBuf += `${error.message}\n`;
+  });
+
+  child.unref();
+
+  if (!child.pid) {
+    return {
+      ok: false,
+      message: formatSshFailure(hostAlias, localPort, "dns forward failed to start", stderrBuf)
+    };
+  }
+
+  const deadline = Date.now() + TUNNEL_READY_TIMEOUT_MS;
+
+  while (Date.now() < deadline) {
+    if (!isProcessAlive(child.pid)) {
+      await wait(150);
+      return {
+        ok: false,
+        message: formatSshFailure(hostAlias, localPort, "dns forward exited early", stderrBuf)
+      };
+    }
+
+    if (await isPortOpen(localPort)) {
+      appendDnsLog(`dns forward ready ${PROXY_HOST}:${localPort} pid=${child.pid}`);
+      return {
+        ok: true,
+        pid: child.pid,
+        localPort,
+        startedAt: new Date().toISOString()
+      };
+    }
+
+    await wait(TUNNEL_POLL_MS);
+  }
+
+  await stopProcess(child.pid);
+  return {
+    ok: false,
+    message: formatSshFailure(hostAlias, localPort, "dns forward timeout", stderrBuf)
+  };
+}
+
+async function ensureDnsForwards(rules, existingForwards) {
+  const needed = new Map();
+
+  for (const rule of rules) {
+    if (rule.kind !== "via_ssh") {
+      continue;
+    }
+
+    const key = forwardKey(rule.hostAlias, rule.nameserver, rule.nameserverPort);
+    needed.set(key, {
+      hostAlias: rule.hostAlias,
+      remoteDns: rule.nameserver,
+      remotePort: rule.nameserverPort
+    });
+  }
+
+  if (needed.size > MAX_DNS_FORWARDS) {
+    return {
+      ok: false,
+      forwards: {},
+      message: `At most ${MAX_DNS_FORWARDS} DNS SSH forwards are supported.`
+    };
+  }
+
+  const next = {};
+  const current = existingForwards && typeof existingForwards === "object" ? { ...existingForwards } : {};
+
+  // Stop unneeded forwards.
+  for (const [key, entry] of Object.entries(current)) {
+    if (!needed.has(key)) {
+      if (entry.pid) {
+        await stopProcess(entry.pid);
+        appendDnsLog(`stopped dns forward ${key}`);
+      }
+
+      delete current[key];
+    }
+  }
+
+  for (const [key, spec] of needed.entries()) {
+    const existing = current[key];
+
+    if (existing && isProcessAlive(existing.pid)) {
+      if (await isRecordedDnsForwardProcess(existing.pid, existing.localPort, spec.hostAlias)) {
+        if (await isPortOpen(existing.localPort)) {
+          next[key] = existing;
+          continue;
+        }
+      }
+
+      await stopProcess(existing.pid);
+    }
+
+    let localPort = existing?.localPort || allocateForwardPort(next);
+
+    if (!localPort) {
+      return {
+        ok: false,
+        forwards: next,
+        message: "No free local DNS forward port."
+      };
+    }
+
+    if (await isPortOpen(localPort)) {
+      localPort = null;
+
+      for (let offset = 0; offset < MAX_DNS_FORWARDS * 4; offset += 1) {
+        const candidate = DNS_FORWARD_BASE_PORT + offset;
+
+        if (usedForwardPorts(next).has(candidate)) {
+          continue;
+        }
+
+        if (!(await isPortOpen(candidate))) {
+          localPort = candidate;
+          break;
+        }
+      }
+    }
+
+    if (!localPort) {
+      return {
+        ok: false,
+        forwards: next,
+        message: `No free local DNS forward port near ${DNS_FORWARD_BASE_PORT}.`
+      };
+    }
+
+    const spawned = await spawnDnsForward(spec.hostAlias, spec.remoteDns, spec.remotePort, localPort);
+
+    if (!spawned.ok) {
+      return {
+        ok: false,
+        forwards: next,
+        message: spawned.message
+      };
+    }
+
+    next[key] = {
+      pid: spawned.pid,
+      localPort: spawned.localPort,
+      hostAlias: spec.hostAlias,
+      remoteDns: spec.remoteDns,
+      remotePort: spec.remotePort,
+      startedAt: spawned.startedAt
+    };
+  }
+
+  return { ok: true, forwards: next };
+}
+
+function buildDaemonConfig(config, forwards) {
+  const rules = [];
+
+  for (const rule of config.rules) {
+    if (rule.kind === "via_ssh") {
+      const key = forwardKey(rule.hostAlias, rule.nameserver, rule.nameserverPort);
+      const forward = forwards[key];
+
+      if (!forward) {
+        continue;
+      }
+
+      rules.push({
+        id: rule.id,
+        enabled: true,
+        domain: rule.domain,
+        label: `${rule.domain}@${rule.hostAlias}`,
+        upstream: {
+          nameserver: PROXY_HOST,
+          nameserverPort: forward.localPort
+        }
+      });
+    } else {
+      rules.push({
+        id: rule.id,
+        enabled: true,
+        domain: rule.domain,
+        label: rule.domain,
+        upstream: {
+          nameserver: rule.nameserver,
+          nameserverPort: rule.nameserverPort
+        }
+      });
+    }
+  }
+
+  return {
+    listenHost: PROXY_HOST,
+    listenPort: config.listenPort,
+    defaultUpstream: config.defaultUpstream,
+    rules
+  };
+}
+
+function writeDnsConfigFile(daemonConfig) {
+  ensureRuntimeDir();
+  fs.writeFileSync(DNS_CONFIG_FILE, JSON.stringify(daemonConfig, null, 2));
+}
+
+async function stopDnsDaemonOnly(dnsState) {
+  if (dnsState?.pid) {
+    await stopProcess(dnsState.pid);
+    appendDnsLog(`stopped dns-daemon pid=${dnsState.pid}`);
+  }
+}
+
+async function stopAllDnsForwards(forwards) {
+  for (const [key, entry] of Object.entries(forwards || {})) {
+    if (entry?.pid) {
+      await stopProcess(entry.pid);
+      appendDnsLog(`stopped dns forward ${key}`);
+    }
+  }
+}
+
+async function spawnDnsDaemon(listenPort) {
+  ensureRuntimeDir();
+  appendDnsLog(`starting dns-daemon on ${PROXY_HOST}:${listenPort}`);
+
+  const child = spawn(process.execPath, [DNS_DAEMON_SCRIPT], {
+    detached: true,
+    stdio: "ignore",
+    cwd: __dirname
+  });
+
+  child.unref();
+
+  if (!child.pid) {
+    return { ok: false, message: "Failed to spawn dns-daemon." };
+  }
+
+  const deadline = Date.now() + 5000;
+
+  while (Date.now() < deadline) {
+    if (!isProcessAlive(child.pid)) {
+      return { ok: false, message: "dns-daemon exited immediately." };
+    }
+
+    // Probe with empty UDP is hard; check process alive after short settle.
+    await wait(150);
+
+    if (isProcessAlive(child.pid)) {
+      // Best-effort: try connecting is wrong for UDP; wait and assume bind ok if alive.
+      await wait(100);
+      appendDnsLog(`dns-daemon ready pid=${child.pid} port=${listenPort}`);
+      return {
+        ok: true,
+        pid: child.pid,
+        port: listenPort,
+        startedAt: new Date().toISOString()
+      };
+    }
+  }
+
+  await stopProcess(child.pid);
+  return { ok: false, message: "dns-daemon failed to become ready." };
+}
+
+async function dnsStart(message) {
+  const normalized = normalizeDnsMessageConfig(message || {});
+
+  if (!normalized.ok) {
+    return { ok: false, state: "error", message: normalized.message, dns: null };
+  }
+
+  const config = normalized.config;
+  const state = readState();
+  const existingDns = state.dns;
+
+  const forwardsResult = await ensureDnsForwards(config.rules, existingDns?.forwards || {});
+
+  if (!forwardsResult.ok) {
+    return {
+      ok: false,
+      state: "error",
+      message: forwardsResult.message,
+      dns: null
+    };
+  }
+
+  const daemonConfig = buildDaemonConfig(config, forwardsResult.forwards);
+  writeDnsConfigFile(daemonConfig);
+
+  // Restart daemon so it reloads config (simple + reliable for one-shot host).
+  if (existingDns?.pid) {
+    await stopDnsDaemonOnly(existingDns);
+  }
+
+  // If something else holds the port, surface a clear error.
+  // UDP bind race: spawn and check process; daemon logs bind errors.
+
+  const spawned = await spawnDnsDaemon(config.listenPort);
+
+  if (!spawned.ok) {
+    await stopAllDnsForwards(forwardsResult.forwards);
+    writeState({ dns: null });
+    return {
+      ok: false,
+      state: "error",
+      message: spawned.message,
+      dns: null
+    };
+  }
+
+  const dns = {
+    pid: spawned.pid,
+    port: spawned.port,
+    startedAt: spawned.startedAt,
+    forwards: forwardsResult.forwards
+  };
+
+  writeState({ dns });
+
+  return {
+    ok: true,
+    state: "running",
+    message: `DNS stub on ${PROXY_HOST}:${dns.port}`,
+    dns: {
+      pid: dns.pid,
+      port: dns.port,
+      startedAt: dns.startedAt,
+      rules: daemonConfig.rules.length,
+      forwards: Object.keys(dns.forwards).length
+    }
+  };
+}
+
+async function dnsStop() {
+  const state = readState();
+  const dns = state.dns;
+
+  if (dns) {
+    await stopDnsDaemonOnly(dns);
+    await stopAllDnsForwards(dns.forwards);
+  }
+
+  writeState({ dns: null });
+
+  return {
+    ok: true,
+    state: "stopped",
+    message: "DNS stopped.",
+    dns: null
+  };
+}
+
+async function dnsStatus() {
+  const state = readState();
+  const dns = state.dns;
+
+  if (!dns) {
+    return {
+      ok: true,
+      state: "stopped",
+      dns: null
+    };
+  }
+
+  if (!isProcessAlive(dns.pid) || !(await isRecordedDnsDaemon(dns.pid))) {
+    await stopAllDnsForwards(dns.forwards);
+    writeState({ dns: null });
+    return {
+      ok: true,
+      state: "stopped",
+      message: "DNS daemon not running.",
+      dns: null
+    };
+  }
+
+  const forwardReports = [];
+
+  for (const [key, entry] of Object.entries(dns.forwards || {})) {
+    const alive = isProcessAlive(entry.pid);
+    const ok = alive && (await isRecordedDnsForwardProcess(entry.pid, entry.localPort, entry.hostAlias));
+    forwardReports.push({
+      key,
+      localPort: entry.localPort,
+      hostAlias: entry.hostAlias,
+      remoteDns: entry.remoteDns,
+      remotePort: entry.remotePort,
+      state: ok ? "connected" : "error"
+    });
+  }
+
+  return {
+    ok: true,
+    state: "running",
+    dns: {
+      pid: dns.pid,
+      port: dns.port,
+      startedAt: dns.startedAt,
+      forwards: forwardReports
+    }
+  };
+}
+
+function encodeDnsName(name) {
+  const labels = String(name)
+    .replace(/\.$/, "")
+    .split(".")
+    .filter(Boolean);
+  const parts = [];
+
+  for (const label of labels) {
+    const buf = Buffer.from(label, "ascii");
+
+    if (buf.length > 63) {
+      throw new Error("label too long");
+    }
+
+    parts.push(Buffer.from([buf.length]));
+    parts.push(buf);
+  }
+
+  parts.push(Buffer.from([0]));
+  return Buffer.concat(parts);
+}
+
+function buildDnsQuery(name, qtype) {
+  const id = Math.floor(Math.random() * 65535);
+  const header = Buffer.alloc(12);
+  header.writeUInt16BE(id, 0);
+  header.writeUInt16BE(0x0100, 2); // RD
+  header.writeUInt16BE(1, 4); // QDCOUNT
+  const qname = encodeDnsName(name);
+  const qtail = Buffer.alloc(4);
+  qtail.writeUInt16BE(qtype, 0);
+  qtail.writeUInt16BE(1, 2); // IN
+  return { id, packet: Buffer.concat([header, qname, qtail]) };
+}
+
+const DNS_QTYPES = {
+  A: 1,
+  NS: 2,
+  CNAME: 5,
+  SOA: 6,
+  PTR: 12,
+  MX: 15,
+  TXT: 16,
+  AAAA: 28,
+  SRV: 33,
+  ANY: 255
+};
+
+function parseDnsAnswers(buffer) {
+  if (!Buffer.isBuffer(buffer) || buffer.length < 12) {
+    return { rcode: 2, answers: [] };
+  }
+
+  const rcode = buffer.readUInt16BE(2) & 0xf;
+  const ancount = buffer.readUInt16BE(6);
+  let offset = 12;
+  const answers = [];
+
+  function skipName() {
+    while (offset < buffer.length) {
+      const len = buffer[offset];
+
+      if (len === 0) {
+        offset += 1;
+        return true;
+      }
+
+      if ((len & 0xc0) === 0xc0) {
+        offset += 2;
+        return true;
+      }
+
+      if (len > 63 || offset + 1 + len > buffer.length) {
+        return false;
+      }
+
+      offset += 1 + len;
+    }
+
+    return false;
+  }
+
+  const qdcount = buffer.readUInt16BE(4);
+
+  for (let i = 0; i < qdcount; i += 1) {
+    if (!skipName() || offset + 4 > buffer.length) {
+      return { rcode, answers };
+    }
+
+    offset += 4;
+  }
+
+  for (let i = 0; i < ancount && answers.length < 16; i += 1) {
+    if (!skipName() || offset + 10 > buffer.length) {
+      break;
+    }
+
+    const type = buffer.readUInt16BE(offset);
+    const ttl = buffer.readUInt32BE(offset + 4);
+    const rdlength = buffer.readUInt16BE(offset + 8);
+    const start = offset + 10;
+    const end = start + rdlength;
+    offset = end;
+
+    if (end > buffer.length) {
+      break;
+    }
+
+    let data = "";
+
+    if (type === 1 && rdlength === 4) {
+      data = Array.from(buffer.slice(start, end)).join(".");
+    } else if (type === 28 && rdlength === 16) {
+      const parts = [];
+
+      for (let j = 0; j < 16; j += 2) {
+        parts.push(buffer.readUInt16BE(start + j).toString(16));
+      }
+
+      data = parts.join(":");
+    } else {
+      data = `TYPE${type}(${rdlength}b)`;
+    }
+
+    answers.push({ type, ttl, data });
+  }
+
+  return { rcode, answers };
+}
+
+function queryUdpDns(packet, host, port, timeoutMs) {
+  return new Promise((resolve) => {
+    const dgram = require("dgram");
+    const socket = dgram.createSocket("udp4");
+    let settled = false;
+
+    function finish(result) {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      clearTimeout(timer);
+
+      try {
+        socket.close();
+      } catch (_error) {
+        // ignore
+      }
+
+      resolve(result);
+    }
+
+    const timer = setTimeout(() => finish(null), timeoutMs);
+
+    socket.on("message", (msg) => finish(msg));
+    socket.on("error", () => finish(null));
+    socket.send(packet, port, host, (error) => {
+      if (error) {
+        finish(null);
+      }
+    });
+  });
+}
+
+async function dnsQuery(message) {
+  const name = normalizeDnsDomain(message.name || message.qname);
+
+  if (!name || !DOMAIN_RE.test(name)) {
+    return { ok: false, state: "error", message: "Invalid query name." };
+  }
+
+  const typeName = String(message.type || message.qtype || "A").toUpperCase();
+  const qtype = DNS_QTYPES[typeName] || Number(message.qtype) || 1;
+  const status = await dnsStatus();
+
+  if (status.state !== "running" || !status.dns?.port) {
+    return {
+      ok: false,
+      state: "error",
+      message: "DNS stub is not running. Turn DNS On first."
+    };
+  }
+
+  let packet;
+
+  try {
+    packet = buildDnsQuery(name, qtype).packet;
+  } catch (error) {
+    return { ok: false, state: "error", message: error.message };
+  }
+
+  const started = Date.now();
+  const response = await queryUdpDns(packet, PROXY_HOST, status.dns.port, 3000);
+  const elapsed = Date.now() - started;
+
+  if (!response) {
+    return {
+      ok: false,
+      state: "error",
+      message: `No response from stub within ${elapsed}ms.`,
+      elapsedMs: elapsed
+    };
+  }
+
+  const parsed = parseDnsAnswers(response);
+
+  return {
+    ok: true,
+    state: "ok",
+    name,
+    type: typeName,
+    rcode: parsed.rcode,
+    answers: parsed.answers,
+    elapsedMs: elapsed,
+    listenPort: status.dns.port
+  };
+}
+
+function readResolverManifest() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(DNS_RESOLVER_MANIFEST, "utf8"));
+    return Array.isArray(raw.files) ? raw.files.map(String) : [];
+  } catch (_error) {
+    return [];
+  }
+}
+
+function writeResolverManifest(files) {
+  ensureRuntimeDir();
+  fs.writeFileSync(DNS_RESOLVER_MANIFEST, JSON.stringify({ files }, null, 2));
+}
+
+async function runOsascriptAdmin(shellScript) {
+  return new Promise((resolve) => {
+    const apple = `do shell script ${JSON.stringify(shellScript)} with administrator privileges`;
+    execFile("osascript", ["-e", apple], { timeout: 120000 }, (error, stdout, stderr) => {
+      if (error) {
+        resolve({
+          ok: false,
+          message: String(stderr || error.message || "osascript failed").trim()
+        });
+        return;
+      }
+
+      resolve({ ok: true, stdout: String(stdout || "") });
+    });
+  });
+}
+
+async function dnsInstallResolver(message) {
+  if (process.platform !== "darwin") {
+    return {
+      ok: false,
+      state: "error",
+      message: "Resolver stubs are only supported on macOS."
+    };
+  }
+
+  const normalized = normalizeDnsMessageConfig(message || {});
+
+  if (!normalized.ok) {
+    return { ok: false, state: "error", message: normalized.message };
+  }
+
+  const port = normalized.config.listenPort;
+  const domains = [
+    ...new Set(normalized.config.rules.map((rule) => rule.domain).filter(Boolean))
+  ];
+
+  if (!domains.length) {
+    return {
+      ok: false,
+      state: "error",
+      message: "No enabled DNS rules to install resolver stubs for."
+    };
+  }
+
+  const lines = ["mkdir -p /etc/resolver"];
+
+  for (const domain of domains) {
+    if (!DOMAIN_RE.test(domain) || domain.includes("/")) {
+      continue;
+    }
+
+    const content = `# Managed by Webhole\nnameserver 127.0.0.1\nport ${port}\n`;
+    const filePath = `${RESOLVER_DIR}/${domain}`;
+    // Write via printf; escape carefully.
+    const b64 = Buffer.from(content, "utf8").toString("base64");
+    lines.push(`echo ${b64} | base64 -d > ${JSON.stringify(filePath)}`);
+  }
+
+  lines.push("true");
+  const result = await runOsascriptAdmin(lines.join(" && "));
+
+  if (!result.ok) {
+    return {
+      ok: false,
+      state: "error",
+      message: result.message || "Failed to install resolver stubs (admin cancelled?)."
+    };
+  }
+
+  writeResolverManifest(domains.map((domain) => `${RESOLVER_DIR}/${domain}`));
+  appendDnsLog(`installed resolver stubs for ${domains.join(", ")} port=${port}`);
+
+  return {
+    ok: true,
+    state: "installed",
+    message: `Installed ${domains.length} resolver stub(s) → 127.0.0.1:${port}`,
+    files: domains.map((domain) => `${RESOLVER_DIR}/${domain}`)
+  };
+}
+
+async function dnsUninstallResolver() {
+  if (process.platform !== "darwin") {
+    return {
+      ok: false,
+      state: "error",
+      message: "Resolver stubs are only supported on macOS."
+    };
+  }
+
+  const files = readResolverManifest();
+
+  if (!files.length) {
+    return {
+      ok: true,
+      state: "absent",
+      message: "No Webhole resolver stubs recorded."
+    };
+  }
+
+  const safeFiles = files.filter(
+    (file) => file.startsWith(`${RESOLVER_DIR}/`) && !file.includes("..")
+  );
+
+  if (!safeFiles.length) {
+    return { ok: true, state: "absent", message: "No safe resolver files to remove." };
+  }
+
+  const script = safeFiles.map((file) => `rm -f ${JSON.stringify(file)}`).join(" && ");
+  const result = await runOsascriptAdmin(script);
+
+  if (!result.ok) {
+    return {
+      ok: false,
+      state: "error",
+      message: result.message || "Failed to uninstall resolver stubs."
+    };
+  }
+
+  writeResolverManifest([]);
+  appendDnsLog(`uninstalled resolver stubs: ${safeFiles.join(", ")}`);
+
+  return {
+    ok: true,
+    state: "uninstalled",
+    message: `Removed ${safeFiles.length} resolver stub(s).`,
+    files: safeFiles
+  };
 }
 
 function expandHomePath(value) {
@@ -998,6 +2021,30 @@ async function handleMessage(message) {
 
   if (message.action === "disconnect") {
     return disconnectAll();
+  }
+
+  if (message.action === "dnsStart") {
+    return dnsStart(message);
+  }
+
+  if (message.action === "dnsStop") {
+    return dnsStop();
+  }
+
+  if (message.action === "dnsStatus") {
+    return dnsStatus();
+  }
+
+  if (message.action === "dnsQuery") {
+    return dnsQuery(message);
+  }
+
+  if (message.action === "dnsInstallResolver") {
+    return dnsInstallResolver(message);
+  }
+
+  if (message.action === "dnsUninstallResolver") {
+    return dnsUninstallResolver();
   }
 
   return { ok: false, state: "error", message: "Unknown action." };

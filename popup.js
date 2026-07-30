@@ -56,7 +56,7 @@ const dnsRulesList = document.getElementById("dnsRulesList");
 const dnsListenPortInput = document.getElementById("dnsListenPort");
 const dnsDefaultNameserverInput = document.getElementById("dnsDefaultNameserver");
 const dnsDefaultNameserverPortInput = document.getElementById("dnsDefaultNameserverPort");
-const dnsInstallResolverStubsInput = document.getElementById("dnsInstallResolverStubs");
+const dnsEnforceInput = document.getElementById("dnsEnforce");
 const addDnsRuleButton = document.getElementById("addDnsRuleButton");
 const enableAllDnsButton = document.getElementById("enableAllDnsButton");
 const disableAllDnsButton = document.getElementById("disableAllDnsButton");
@@ -66,6 +66,7 @@ const dnsTestNameInput = document.getElementById("dnsTestName");
 const dnsTestTypeSelect = document.getElementById("dnsTestType");
 const dnsQueryButton = document.getElementById("dnsQueryButton");
 const dnsStatusEl = document.getElementById("dnsStatus");
+const dnsEnforceStatusEl = document.getElementById("dnsEnforceStatus");
 const dnsInstallResolverButton = document.getElementById("dnsInstallResolverButton");
 const dnsUninstallResolverButton = document.getElementById("dnsUninstallResolverButton");
 
@@ -624,8 +625,17 @@ function collectDnsSettingsFromUi() {
     dnsDefaultNameserver: String(dnsDefaultNameserverInput?.value || DEFAULT_DNS_NAMESERVER).trim(),
     dnsDefaultNameserverPort: Number(dnsDefaultNameserverPortInput?.value) || 53,
     dnsRules: normalizeDnsRules(readDnsRulesFromDom()),
-    dnsInstallResolverStubs: Boolean(dnsInstallResolverStubsInput?.checked)
+    dnsEnforce: dnsEnforceInput ? Boolean(dnsEnforceInput.checked) : true
   };
+}
+
+function setDnsEnforceStatus(message, isError = false) {
+  if (!dnsEnforceStatusEl) {
+    return;
+  }
+
+  dnsEnforceStatusEl.textContent = message || "";
+  dnsEnforceStatusEl.classList.toggle("is-error", Boolean(isError));
 }
 
 function renderDnsRules(rules) {
@@ -865,6 +875,23 @@ async function refreshDnsStatus() {
     } else if (response?.message && response.state === "error") {
       setDnsStatus(response.message, true);
     }
+
+    const enforce = await sendDnsMessage("dnsEnforceStatus", {}, 8000);
+
+    if (enforce?.ok) {
+      const parts = [];
+      parts.push(enforce.enforce ? "Enforce ON" : "Enforce OFF");
+      parts.push(enforce.dnsState === "running" ? `stub:${enforce.dns?.port}` : "stub:off");
+      parts.push(enforce.dns?.resolverInstalled ? "resolver:ok" : "resolver:?");
+      const doh = enforce.secureDns?.value;
+      parts.push(doh === "off" ? "DoH:off" : `DoH:${doh || "?"}`);
+      parts.push(enforce.gateway?.port ? `gw:${enforce.gateway.port}` : "gw:off");
+      const warn =
+        enforce.enforce &&
+        enforce.dnsState === "running" &&
+        (doh && doh !== "off" || enforce.secureDns && !enforce.secureDns.ok);
+      setDnsEnforceStatus(parts.join(" · "), Boolean(warn));
+    }
   } catch (error) {
     setDnsStatus(error.message, true);
   }
@@ -889,14 +916,34 @@ async function connectDns() {
 
   // Allow start with zero rules (default-only stub) or with rules.
   setDnsConnectButtonState("starting");
-  setDnsStatus(complete.length ? `Starting DNS (${complete.length} rules)…` : "Starting DNS (default only)…");
+  setDnsStatus(
+    complete.length
+      ? `Starting DNS Enforce (${complete.length} rules)…`
+      : "Starting DNS (default only)…"
+  );
+  setDnsEnforceStatus(settings.dnsEnforce ? "Installing resolver / disabling DoH…" : "");
 
   try {
     chrome.storage.local.set(settings);
     const response = await sendDnsMessage("dnsStart");
     setDnsConnectButtonState(response?.ok && response.state === "running" ? "running" : "stopped");
     setDnsStatus(response?.message || (response?.ok ? "DNS started" : "DNS start failed"), !response?.ok);
+
+    if (Array.isArray(response?.enforceWarnings) && response.enforceWarnings.length) {
+      setDnsEnforceStatus(response.enforceWarnings.join(" · "), true);
+    } else if (response?.ok) {
+      setDnsEnforceStatus(
+        [
+          response.enforce ? "Enforce ON" : "Enforce OFF",
+          response.dns?.resolverInstalled ? "resolver installed" : "resolver skipped/failed",
+          response.secureDns?.ok === false ? response.secureDns.message : "DoH handled"
+        ].join(" · "),
+        Boolean(response.secureDns && response.secureDns.ok === false)
+      );
+    }
+
     appendLog(`DNS On: ${response?.message || response?.state}`);
+    await refreshDnsStatus();
   } catch (error) {
     setDnsConnectButtonState("stopped");
     setDnsStatus(error.message, true);
@@ -1478,7 +1525,7 @@ function migrateLoadedSettings(items) {
     dnsDefaultNameserver: String(items.dnsDefaultNameserver || DEFAULT_DNS_NAMESERVER).trim(),
     dnsDefaultNameserverPort: Number(items.dnsDefaultNameserverPort) || 53,
     dnsRules: normalizeDnsRules(items.dnsRules),
-    dnsInstallResolverStubs: Boolean(items.dnsInstallResolverStubs)
+    dnsEnforce: items.dnsEnforce !== false
   };
 }
 
@@ -1495,7 +1542,7 @@ function bootPopup() {
       dnsDefaultNameserver: DEFAULT_DNS_NAMESERVER,
       dnsDefaultNameserverPort: 53,
       dnsRules: [],
-      dnsInstallResolverStubs: false,
+      dnsEnforce: true,
       logs: []
     },
     async (items) => {
@@ -1527,8 +1574,8 @@ function bootPopup() {
           dnsDefaultNameserverPortInput.value = String(migrated.dnsDefaultNameserverPort);
         }
 
-        if (dnsInstallResolverStubsInput) {
-          dnsInstallResolverStubsInput.checked = migrated.dnsInstallResolverStubs;
+        if (dnsEnforceInput) {
+          dnsEnforceInput.checked = migrated.dnsEnforce !== false;
         }
 
         renderLogs(items?.logs);
@@ -1592,7 +1639,7 @@ dnsUninstallResolverButton?.addEventListener("click", uninstallDnsResolver);
 dnsListenPortInput?.addEventListener("change", () => saveDnsSettings());
 dnsDefaultNameserverInput?.addEventListener("change", () => saveDnsSettings());
 dnsDefaultNameserverPortInput?.addEventListener("change", () => saveDnsSettings());
-dnsInstallResolverStubsInput?.addEventListener("change", () => saveDnsSettings());
+dnsEnforceInput?.addEventListener("change", () => saveDnsSettings());
 
 helpToggle?.addEventListener("click", () => {
   helpSection?.classList.toggle("is-open");

@@ -69,14 +69,21 @@ function loadConfig() {
 
     rules.sort((a, b) => b.domain.length - a.domain.length);
 
-    return { listenHost, listenPort, defaultUpstream, rules };
+    return {
+      listenHost,
+      listenPort,
+      defaultUpstream,
+      rules,
+      enforce: raw.enforce !== false
+    };
   } catch (error) {
     appendLog(`config load failed: ${error.message}`);
     return {
       listenHost: "127.0.0.1",
       listenPort: 53535,
       defaultUpstream: { nameserver: "1.1.1.1", nameserverPort: 53 },
-      rules: []
+      rules: [],
+      enforce: true
     };
   }
 }
@@ -213,20 +220,45 @@ function matchRule(qname, rules) {
   return null;
 }
 
-function buildServFail(query) {
+function buildDnsError(query, rcode) {
   if (!Buffer.isBuffer(query) || query.length < 12) {
     return null;
   }
 
   const response = Buffer.from(query);
-  // QR=1, copy opcode, AA=0, TC=0, RD copy, RA=0, RCODE=SERVFAIL(2)
+  // QR=1, copy opcode/RD, RA=0, RCODE
   const flags = response.readUInt16BE(2);
   const rd = flags & 0x0100;
-  response.writeUInt16BE(0x8000 | rd | 0x0002, 2);
+  const code = Number(rcode) & 0xf;
+  response.writeUInt16BE(0x8000 | rd | code, 2);
   response.writeUInt16BE(0, 6); // ANCOUNT
   response.writeUInt16BE(0, 8); // NSCOUNT
   response.writeUInt16BE(0, 10); // ARCOUNT
   return response.slice(0, Math.min(response.length, 512));
+}
+
+function buildServFail(query) {
+  return buildDnsError(query, 2);
+}
+
+function buildNxDomain(query) {
+  return buildDnsError(query, 3);
+}
+
+function responseHasAnswers(response) {
+  if (!Buffer.isBuffer(response) || response.length < 12) {
+    return false;
+  }
+
+  return response.readUInt16BE(6) > 0;
+}
+
+function responseRcode(response) {
+  if (!Buffer.isBuffer(response) || response.length < 12) {
+    return 2;
+  }
+
+  return response.readUInt16BE(2) & 0xf;
 }
 
 function extractMinTtl(response) {
@@ -500,27 +532,45 @@ async function handleQuery(msg, rinfo, config, server) {
 
   const upstreamResponse = await forwardUdp(msg, upstream);
   const elapsed = Date.now() - started;
+  // Enforce: matched rules must not soft-fail into OS fallback.
+  // Prefer NXDOMAIN over SERVFAIL/empty when the chosen upstream has no answer.
+  const enforceHard = Boolean(config.enforce) || Boolean(rule);
 
   if (!upstreamResponse) {
-    const fail = buildServFail(msg);
+    const fail = enforceHard ? buildNxDomain(msg) : buildServFail(msg);
 
     if (fail) {
       server.send(fail, rinfo.port, rinfo.address);
     }
 
     appendLog(
-      `FAIL ${question.qname} ${QTYPE_NAMES[question.qtype] || question.qtype} via=${ruleLabel} up=${upstream.nameserver}:${upstream.nameserverPort} ${elapsed}ms`
+      `FAIL ${question.qname} ${QTYPE_NAMES[question.qtype] || question.qtype} via=${ruleLabel} up=${upstream.nameserver}:${upstream.nameserverPort} rcode=${enforceHard ? 3 : 2} enforce=${enforceHard ? 1 : 0} ${elapsed}ms`
     );
     return;
   }
 
-  cacheSet(cacheKey, upstreamResponse);
-  server.send(upstreamResponse, rinfo.port, rinfo.address);
-
+  let reply = upstreamResponse;
+  let rcode = responseRcode(upstreamResponse);
   const answers = parseAnswersSummary(upstreamResponse);
-  const rcode = upstreamResponse.readUInt16BE(2) & 0xf;
+
+  // Matched rule + no answers (e.g. public DNS empty) → NXDOMAIN so macOS/Chrome do not fall through.
+  if (enforceHard && !responseHasAnswers(upstreamResponse) && (rcode === 0 || rcode === 2 || rcode === 3)) {
+    const nx = buildNxDomain(msg);
+
+    if (nx) {
+      reply = nx;
+      rcode = 3;
+    }
+  }
+
+  if (rcode === 0 && responseHasAnswers(reply)) {
+    cacheSet(cacheKey, reply);
+  }
+
+  server.send(reply, rinfo.port, rinfo.address);
+
   appendLog(
-    `OK ${question.qname} ${QTYPE_NAMES[question.qtype] || question.qtype} rcode=${rcode} via=${ruleLabel} up=${upstream.nameserver}:${upstream.nameserverPort} answers=${answers.join(",") || "-"} ${elapsed}ms`
+    `OK ${question.qname} ${QTYPE_NAMES[question.qtype] || question.qtype} rcode=${rcode} via=${ruleLabel} up=${upstream.nameserver}:${upstream.nameserverPort} answers=${answers.join(",") || "-"} enforce=${enforceHard ? 1 : 0} ${elapsed}ms`
   );
 }
 

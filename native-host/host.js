@@ -15,6 +15,7 @@ const BASE_PORT = 1080;
 // Avoid 5353 (often used by mDNSResponder on macOS).
 const DNS_DEFAULT_PORT = 53535;
 const DNS_FORWARD_BASE_PORT = 15353;
+const GATEWAY_DEFAULT_PORT = 18080;
 const MAX_TUNNELS = 8;
 const MAX_DNS_RULES = 50;
 const MAX_DNS_FORWARDS = 16;
@@ -30,6 +31,8 @@ const DNS_LOG_FILE = path.join(RUNTIME_DIR, "dns.log");
 const DNS_CONFIG_FILE = path.join(RUNTIME_DIR, "dns-config.json");
 const DNS_RESOLVER_MANIFEST = path.join(RUNTIME_DIR, "resolver-files.json");
 const DNS_DAEMON_SCRIPT = path.join(__dirname, "dns-daemon.js");
+const GATEWAY_SCRIPT = path.join(__dirname, "proxy-gateway.js");
+const GATEWAY_CONFIG_FILE = path.join(RUNTIME_DIR, "gateway-config.json");
 const DEFAULT_SSH_CONFIG = path.join(os.homedir(), ".ssh", "config");
 const RESOLVER_DIR = "/etc/resolver";
 
@@ -43,6 +46,25 @@ function readRawState() {
   } catch (error) {
     return {};
   }
+}
+
+function normalizeGatewayState(rawGateway) {
+  if (!rawGateway || typeof rawGateway !== "object") {
+    return null;
+  }
+
+  const pid = Number(rawGateway.pid);
+  const port = Number(rawGateway.port);
+
+  if (!Number.isInteger(pid) || pid <= 0 || !Number.isInteger(port) || port < 1) {
+    return null;
+  }
+
+  return {
+    pid,
+    port,
+    startedAt: rawGateway.startedAt || ""
+  };
 }
 
 function normalizeDnsState(rawDns) {
@@ -87,7 +109,10 @@ function normalizeDnsState(rawDns) {
     pid,
     port,
     startedAt: rawDns.startedAt || "",
-    forwards
+    forwards,
+    enforce: rawDns.enforce !== false,
+    resolverInstalled: Boolean(rawDns.resolverInstalled),
+    gateway: normalizeGatewayState(rawDns.gateway)
   };
 }
 
@@ -907,6 +932,11 @@ async function isRecordedDnsDaemon(pid) {
   return command.includes("dns-daemon.js") || command.includes("dns-daemon");
 }
 
+async function isRecordedGateway(pid) {
+  const command = await readProcessCommand(pid);
+  return command.includes("proxy-gateway.js") || command.includes("proxy-gateway");
+}
+
 async function stopProcess(pid) {
   await stopTunnelProcess(pid);
 }
@@ -1127,7 +1157,7 @@ async function ensureDnsForwards(rules, existingForwards) {
   return { ok: true, forwards: next };
 }
 
-function buildDaemonConfig(config, forwards) {
+function buildDaemonConfig(config, forwards, enforce) {
   const rules = [];
 
   for (const rule of config.rules) {
@@ -1167,7 +1197,8 @@ function buildDaemonConfig(config, forwards) {
     listenHost: PROXY_HOST,
     listenPort: config.listenPort,
     defaultUpstream: config.defaultUpstream,
-    rules
+    rules,
+    enforce: enforce !== false
   };
 }
 
@@ -1242,9 +1273,16 @@ async function dnsStart(message) {
     return { ok: false, state: "error", message: normalized.message, dns: null };
   }
 
+  const enforce = message?.enforce !== false;
+  const autoInstallResolver = message?.autoInstallResolver !== false && enforce;
   const config = normalized.config;
   const state = readState();
   const existingDns = state.dns;
+
+  // Keep gateway if tunnels still need it; stop/restart separately via gatewayStart.
+  if (existingDns?.gateway?.pid) {
+    await stopGatewayOnly(existingDns.gateway);
+  }
 
   const forwardsResult = await ensureDnsForwards(config.rules, existingDns?.forwards || {});
 
@@ -1257,16 +1295,13 @@ async function dnsStart(message) {
     };
   }
 
-  const daemonConfig = buildDaemonConfig(config, forwardsResult.forwards);
+  const daemonConfig = buildDaemonConfig(config, forwardsResult.forwards, enforce);
   writeDnsConfigFile(daemonConfig);
 
   // Restart daemon so it reloads config (simple + reliable for one-shot host).
   if (existingDns?.pid) {
     await stopDnsDaemonOnly(existingDns);
   }
-
-  // If something else holds the port, surface a clear error.
-  // UDP bind race: spawn and check process; daemon logs bind errors.
 
   const spawned = await spawnDnsDaemon(config.listenPort);
 
@@ -1281,25 +1316,58 @@ async function dnsStart(message) {
     };
   }
 
+  let resolverInstalled = false;
+  let resolverMessage = "";
+
+  if (autoInstallResolver && config.rules.length) {
+    const installed = await dnsInstallResolver({
+      ...message,
+      listenPort: config.listenPort,
+      defaultNameserver: config.defaultUpstream.nameserver,
+      defaultNameserverPort: config.defaultUpstream.nameserverPort,
+      rules: config.rules.map((rule) => ({ ...rule, enabled: true }))
+    });
+    resolverInstalled = Boolean(installed.ok);
+    resolverMessage = installed.message || "";
+
+    if (!installed.ok) {
+      appendDnsLog(`auto resolver install failed: ${resolverMessage}`);
+    }
+  } else if (autoInstallResolver && !config.rules.length) {
+    resolverMessage = "No DNS rules; resolver stubs skipped.";
+  }
+
   const dns = {
     pid: spawned.pid,
     port: spawned.port,
     startedAt: spawned.startedAt,
-    forwards: forwardsResult.forwards
+    forwards: forwardsResult.forwards,
+    enforce,
+    resolverInstalled,
+    gateway: null
   };
 
   writeState({ dns });
 
+  const parts = [`DNS stub on ${PROXY_HOST}:${dns.port}`];
+
+  if (autoInstallResolver) {
+    parts.push(resolverInstalled ? "resolver installed" : `resolver: ${resolverMessage || "not installed"}`);
+  }
+
   return {
     ok: true,
     state: "running",
-    message: `DNS stub on ${PROXY_HOST}:${dns.port}`,
+    message: parts.join("; "),
     dns: {
       pid: dns.pid,
       port: dns.port,
       startedAt: dns.startedAt,
       rules: daemonConfig.rules.length,
-      forwards: Object.keys(dns.forwards).length
+      forwards: Object.keys(dns.forwards).length,
+      enforce,
+      resolverInstalled,
+      resolverMessage
     }
   };
 }
@@ -1308,9 +1376,20 @@ async function dnsStop() {
   const state = readState();
   const dns = state.dns;
 
+  if (dns?.gateway) {
+    await stopGatewayOnly(dns.gateway);
+  }
+
   if (dns) {
     await stopDnsDaemonOnly(dns);
     await stopAllDnsForwards(dns.forwards);
+  }
+
+  let resolverMessage = "";
+
+  if (process.platform === "darwin") {
+    const uninstalled = await dnsUninstallResolver();
+    resolverMessage = uninstalled.message || "";
   }
 
   writeState({ dns: null });
@@ -1318,7 +1397,7 @@ async function dnsStop() {
   return {
     ok: true,
     state: "stopped",
-    message: "DNS stopped.",
+    message: resolverMessage ? `DNS stopped. ${resolverMessage}` : "DNS stopped.",
     dns: null
   };
 }
@@ -1336,6 +1415,10 @@ async function dnsStatus() {
   }
 
   if (!isProcessAlive(dns.pid) || !(await isRecordedDnsDaemon(dns.pid))) {
+    if (dns.gateway?.pid) {
+      await stopGatewayOnly(dns.gateway);
+    }
+
     await stopAllDnsForwards(dns.forwards);
     writeState({ dns: null });
     return {
@@ -1361,6 +1444,22 @@ async function dnsStatus() {
     });
   }
 
+  let gateway = null;
+
+  if (dns.gateway?.pid) {
+    if (isProcessAlive(dns.gateway.pid) && (await isRecordedGateway(dns.gateway.pid))) {
+      gateway = {
+        pid: dns.gateway.pid,
+        port: dns.gateway.port,
+        startedAt: dns.gateway.startedAt,
+        state: "running"
+      };
+    } else {
+      const nextDns = { ...dns, gateway: null };
+      writeState({ dns: nextDns });
+    }
+  }
+
   return {
     ok: true,
     state: "running",
@@ -1368,9 +1467,180 @@ async function dnsStatus() {
       pid: dns.pid,
       port: dns.port,
       startedAt: dns.startedAt,
-      forwards: forwardReports
+      forwards: forwardReports,
+      enforce: dns.enforce !== false,
+      resolverInstalled: Boolean(dns.resolverInstalled),
+      gateway
     }
   };
+}
+
+function writeGatewayConfigFile(config) {
+  ensureRuntimeDir();
+  fs.writeFileSync(GATEWAY_CONFIG_FILE, JSON.stringify(config, null, 2));
+}
+
+async function stopGatewayOnly(gateway) {
+  if (gateway?.pid) {
+    await stopProcess(gateway.pid);
+    appendDnsLog(`stopped proxy-gateway pid=${gateway.pid}`);
+  }
+}
+
+async function spawnGateway(listenPort) {
+  ensureRuntimeDir();
+  appendDnsLog(`starting proxy-gateway on ${PROXY_HOST}:${listenPort}`);
+
+  const child = spawn(process.execPath, [GATEWAY_SCRIPT], {
+    detached: true,
+    stdio: "ignore",
+    cwd: __dirname
+  });
+
+  child.unref();
+
+  if (!child.pid) {
+    return { ok: false, message: "Failed to spawn proxy-gateway." };
+  }
+
+  const deadline = Date.now() + 5000;
+
+  while (Date.now() < deadline) {
+    if (!isProcessAlive(child.pid)) {
+      return { ok: false, message: "proxy-gateway exited immediately." };
+    }
+
+    if (await isPortOpen(listenPort)) {
+      appendDnsLog(`proxy-gateway ready pid=${child.pid} port=${listenPort}`);
+      return {
+        ok: true,
+        pid: child.pid,
+        port: listenPort,
+        startedAt: new Date().toISOString()
+      };
+    }
+
+    await wait(100);
+  }
+
+  if (isProcessAlive(child.pid) && (await isPortOpen(listenPort))) {
+    return {
+      ok: true,
+      pid: child.pid,
+      port: listenPort,
+      startedAt: new Date().toISOString()
+    };
+  }
+
+  await stopProcess(child.pid);
+  return { ok: false, message: "proxy-gateway failed to become ready." };
+}
+
+async function gatewayStart(message) {
+  const dnsState = readState().dns;
+
+  if (!dnsState?.pid || !isProcessAlive(dnsState.pid)) {
+    return {
+      ok: false,
+      state: "error",
+      message: "DNS stub must be running before gateway start."
+    };
+  }
+
+  const listenPort = Number(message.listenPort) || GATEWAY_DEFAULT_PORT;
+  const dnsPort = Number(message.dnsPort) || dnsState.port || DNS_DEFAULT_PORT;
+  const mode = message.mode === "global" ? "global" : "routes";
+  const rulesIn = Array.isArray(message.rules) ? message.rules : [];
+  const rules = [];
+
+  for (const rule of rulesIn) {
+    const hostPattern = String(rule.hostPattern || "")
+      .toLowerCase()
+      .replace(/\.$/, "");
+    const socksPort = Number(rule.socksPort || rule.port);
+
+    if (!hostPattern || !Number.isInteger(socksPort) || socksPort < 1) {
+      continue;
+    }
+
+    rules.push({
+      hostPattern,
+      pathPrefix: String(rule.pathPrefix || ""),
+      socksPort
+    });
+  }
+
+  const fallbackSocksPort = Number(message.fallbackSocksPort) || 0;
+
+  if (mode === "global" && !fallbackSocksPort) {
+    return {
+      ok: false,
+      state: "error",
+      message: "Global gateway requires fallbackSocksPort."
+    };
+  }
+
+  if (mode === "routes" && !rules.length && !fallbackSocksPort) {
+    return {
+      ok: false,
+      state: "error",
+      message: "Gateway has no SOCKS routes."
+    };
+  }
+
+  writeGatewayConfigFile({
+    listenHost: PROXY_HOST,
+    listenPort,
+    dnsHost: PROXY_HOST,
+    dnsPort,
+    mode,
+    rules,
+    fallbackSocksPort
+  });
+
+  if (dnsState.gateway?.pid) {
+    await stopGatewayOnly(dnsState.gateway);
+  }
+
+  const spawned = await spawnGateway(listenPort);
+
+  if (!spawned.ok) {
+    const next = { ...dnsState, gateway: null };
+    writeState({ dns: next });
+    return { ok: false, state: "error", message: spawned.message };
+  }
+
+  const gateway = {
+    pid: spawned.pid,
+    port: spawned.port,
+    startedAt: spawned.startedAt
+  };
+
+  writeState({
+    dns: {
+      ...dnsState,
+      gateway
+    }
+  });
+
+  return {
+    ok: true,
+    state: "running",
+    message: `Gateway on ${PROXY_HOST}:${gateway.port}`,
+    gateway
+  };
+}
+
+async function gatewayStop() {
+  const state = readState();
+  const dns = state.dns;
+
+  if (dns?.gateway) {
+    await stopGatewayOnly(dns.gateway);
+    writeState({ dns: { ...dns, gateway: null } });
+  }
+
+  return { ok: true, state: "stopped", message: "Gateway stopped.", gateway: null };
 }
 
 function encodeDnsName(name) {
@@ -1651,7 +1921,18 @@ async function dnsInstallResolver(message) {
     };
   }
 
+  const previous = readResolverManifest();
+  const nextFiles = domains
+    .filter((domain) => DOMAIN_RE.test(domain) && !domain.includes("/"))
+    .map((domain) => `${RESOLVER_DIR}/${domain}`);
   const lines = ["mkdir -p /etc/resolver"];
+
+  // Remove stale Webhole-managed stubs no longer in the rule set.
+  for (const file of previous) {
+    if (file.startsWith(`${RESOLVER_DIR}/`) && !nextFiles.includes(file) && !file.includes("..")) {
+      lines.push(`rm -f ${JSON.stringify(file)}`);
+    }
+  }
 
   for (const domain of domains) {
     if (!DOMAIN_RE.test(domain) || domain.includes("/")) {
@@ -1660,11 +1941,12 @@ async function dnsInstallResolver(message) {
 
     const content = `# Managed by Webhole\nnameserver 127.0.0.1\nport ${port}\n`;
     const filePath = `${RESOLVER_DIR}/${domain}`;
-    // Write via printf; escape carefully.
     const b64 = Buffer.from(content, "utf8").toString("base64");
     lines.push(`echo ${b64} | base64 -d > ${JSON.stringify(filePath)}`);
   }
 
+  lines.push("dscacheutil -flushcache >/dev/null 2>&1 || true");
+  lines.push("killall -HUP mDNSResponder >/dev/null 2>&1 || true");
   lines.push("true");
   const result = await runOsascriptAdmin(lines.join(" && "));
 
@@ -1676,14 +1958,14 @@ async function dnsInstallResolver(message) {
     };
   }
 
-  writeResolverManifest(domains.map((domain) => `${RESOLVER_DIR}/${domain}`));
+  writeResolverManifest(nextFiles);
   appendDnsLog(`installed resolver stubs for ${domains.join(", ")} port=${port}`);
 
   return {
     ok: true,
     state: "installed",
-    message: `Installed ${domains.length} resolver stub(s) → 127.0.0.1:${port}`,
-    files: domains.map((domain) => `${RESOLVER_DIR}/${domain}`)
+    message: `Installed ${nextFiles.length} resolver stub(s) → 127.0.0.1:${port}`,
+    files: nextFiles
   };
 }
 
@@ -1714,7 +1996,12 @@ async function dnsUninstallResolver() {
     return { ok: true, state: "absent", message: "No safe resolver files to remove." };
   }
 
-  const script = safeFiles.map((file) => `rm -f ${JSON.stringify(file)}`).join(" && ");
+  const script = [
+    ...safeFiles.map((file) => `rm -f ${JSON.stringify(file)}`),
+    "dscacheutil -flushcache >/dev/null 2>&1 || true",
+    "killall -HUP mDNSResponder >/dev/null 2>&1 || true",
+    "true"
+  ].join(" && ");
   const result = await runOsascriptAdmin(script);
 
   if (!result.ok) {
@@ -2045,6 +2332,14 @@ async function handleMessage(message) {
 
   if (message.action === "dnsUninstallResolver") {
     return dnsUninstallResolver();
+  }
+
+  if (message.action === "gatewayStart") {
+    return gatewayStart(message);
+  }
+
+  if (message.action === "gatewayStop") {
+    return gatewayStop();
   }
 
   return { ok: false, state: "error", message: "Unknown action." };

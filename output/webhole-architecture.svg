@@ -1,107 +1,75 @@
-<svg width="1040" height="640" viewBox="0 0 1040 640" role="img" aria-labelledby="arch-title arch-desc" xmlns="http://www.w3.org/2000/svg">
-  <title id="arch-title">Webhole architecture (SOCKS routes + Split DNS)</title>
-  <desc id="arch-desc">Architecture diagram: popup and background control native host, which manages detached ssh -D SOCKS tunnels, ssh -L DNS forwards, and a local dns-daemon stub. Optional macOS /etc/resolver stubs point selected domains at the stub.</desc>
+<svg width="1040" height="680" viewBox="0 0 1040 680" role="img" aria-labelledby="arch-title arch-desc" xmlns="http://www.w3.org/2000/svg">
+  <title id="arch-title">Webhole DNS Enforce architecture</title>
+  <desc id="arch-desc">Chrome with DoH off, optional PAC to local gateway, DNS stub, /etc/resolver, and SSH tunnels.</desc>
   <defs>
-    <marker id="arch-arrow" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
-      <path d="M 0 0 L 10 5 L 0 10 z" fill="#2563eb" />
+    <marker id="a" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#2563eb"/>
     </marker>
-    <marker id="arch-arrow-green" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
-      <path d="M 0 0 L 10 5 L 0 10 z" fill="#059669" />
-    </marker>
-    <filter id="arch-shadow" x="-10%" y="-10%" width="120%" height="125%">
-      <feDropShadow dx="0" dy="6" stdDeviation="6" flood-color="#0f172a" flood-opacity="0.12"/>
-    </filter>
     <style>
-      .bg { fill: #f8fafc; }
-      .card { fill: #ffffff; stroke: #cbd5e1; stroke-width: 1.4; filter: url(#arch-shadow); }
-      .card-ui { fill: #eff6ff; stroke: #60a5fa; }
-      .card-bg { fill: #eef2ff; stroke: #818cf8; }
-      .card-native { fill: #f0fdf4; stroke: #4ade80; }
-      .card-ssh { fill: #fff7ed; stroke: #fb923c; }
-      .card-dns { fill: #ecfeff; stroke: #22d3ee; }
-      .card-os { fill: #faf5ff; stroke: #c084fc; }
-      .title { fill: #0f172a; font: 700 18px Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-      .label { fill: #0f172a; font: 700 14px Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-      .small { fill: #475569; font: 12px Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-      .edge { stroke: #2563eb; stroke-width: 2.2; fill: none; marker-end: url(#arch-arrow); }
-      .edge-dns { stroke: #059669; stroke-width: 2.2; fill: none; marker-end: url(#arch-arrow-green); }
-      .edge-muted { stroke: #64748b; stroke-width: 1.8; fill: none; marker-end: url(#arch-arrow); stroke-dasharray: 6 5; }
-      .edge-label { fill: #1d4ed8; font: 11px Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-      .edge-label-dns { fill: #047857; font: 11px Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .bg{fill:#f8fafc}.card{fill:#fff;stroke:#cbd5e1;stroke-width:1.4}
+      .c1{fill:#eff6ff;stroke:#60a5fa}.c2{fill:#eef2ff;stroke:#818cf8}
+      .c3{fill:#f0fdf4;stroke:#4ade80}.c4{fill:#ecfeff;stroke:#22d3ee}
+      .c5{fill:#fff7ed;stroke:#fb923c}.c6{fill:#faf5ff;stroke:#c084fc}
+      .t{fill:#0f172a;font:700 18px system-ui,sans-serif}
+      .l{fill:#0f172a;font:700 13px system-ui,sans-serif}
+      .s{fill:#475569;font:12px system-ui,sans-serif}
+      .e{stroke:#2563eb;stroke-width:2;fill:none;marker-end:url(#a)}
+      .eg{stroke:#059669;stroke-width:2;fill:none;marker-end:url(#a)}
     </style>
   </defs>
+  <rect class="bg" width="1040" height="680" rx="20"/>
+  <text class="t" x="36" y="40">Webhole v0.4 — DNS Enforce</text>
+  <text class="s" x="36" y="62">Three gates: /etc/resolver + Chrome DoH off + resolve-then-proxy gateway</text>
 
-  <rect class="bg" width="1040" height="640" rx="24" />
-  <text class="title" x="36" y="44">Webhole Architecture (v0.3)</text>
-  <text class="small" x="36" y="66">Two independent planes: SOCKS routing (proxy) and Split DNS (name resolution).</text>
+  <rect class="card c1" x="36" y="100" width="200" height="100" rx="12"/>
+  <text class="l" x="90" y="140">Chrome</text>
+  <text class="s" x="56" y="164">DoH forced off</text>
+  <text class="s" x="56" y="182">PAC / proxy</text>
 
-  <rect class="card card-ui" x="36" y="100" width="180" height="100" rx="14" />
-  <text class="label" x="88" y="140">Popup UI</text>
-  <text class="small" x="56" y="164">Routes + Split DNS</text>
-  <text class="small" x="56" y="182">On / Off / Query</text>
+  <rect class="card c2" x="300" y="100" width="200" height="100" rx="12"/>
+  <text class="l" x="340" y="140">background.js</text>
+  <text class="s" x="320" y="164">privacy + PAC</text>
+  <text class="s" x="320" y="182">native messages</text>
 
-  <rect class="card card-bg" x="280" y="100" width="210" height="100" rx="14" />
-  <text class="label" x="318" y="136">background.js</text>
-  <text class="small" x="300" y="160">proxy PAC / fixed</text>
-  <text class="small" x="300" y="178">reconcile tunnel + DNS</text>
+  <rect class="card c3" x="580" y="90" width="220" height="120" rx="12"/>
+  <text class="l" x="620" y="130">native host.js</text>
+  <text class="s" x="600" y="154">dns / gateway / ssh</text>
+  <text class="s" x="600" y="172">auto /etc/resolver</text>
+  <text class="s" x="600" y="190">state.json</text>
 
-  <rect class="card card-native" x="560" y="88" width="220" height="124" rx="14" />
-  <text class="label" x="600" y="124">native-host/host.js</text>
-  <text class="small" x="580" y="148">one-shot native msgs</text>
-  <text class="small" x="580" y="166">state.json lifecycle</text>
-  <text class="small" x="580" y="184">dnsStart / connect…</text>
+  <rect class="card c4" x="36" y="300" width="220" height="100" rx="12"/>
+  <text class="l" x="70" y="340">dns-daemon :53535</text>
+  <text class="s" x="56" y="364">suffix → upstream</text>
+  <text class="s" x="56" y="382">NXDOMAIN if empty</text>
 
-  <rect class="card card-ssh" x="36" y="300" width="220" height="110" rx="14" />
-  <text class="label" x="72" y="340">ssh -D SOCKS5</text>
-  <text class="small" x="56" y="364">127.0.0.1:1080+</text>
-  <text class="small" x="56" y="382">per SSH Host alias</text>
+  <rect class="card c5" x="300" y="300" width="220" height="100" rx="12"/>
+  <text class="l" x="330" y="340">proxy-gateway</text>
+  <text class="s" x="320" y="364">:18080 CONNECT</text>
+  <text class="s" x="320" y="382">resolve only via stub</text>
 
-  <rect class="card card-dns" x="300" y="300" width="230" height="110" rx="14" />
-  <text class="label" x="340" y="340">dns-daemon.js</text>
-  <text class="small" x="320" y="364">UDP stub 127.0.0.1:53535</text>
-  <text class="small" x="320" y="382">suffix → upstream</text>
+  <rect class="card c5" x="580" y="300" width="220" height="100" rx="12"/>
+  <text class="l" x="620" y="340">ssh -D SOCKS</text>
+  <text class="s" x="600" y="364">by IP after resolve</text>
+  <text class="s" x="600" y="382">no remote DNS</text>
 
-  <rect class="card card-ssh" x="580" y="300" width="230" height="110" rx="14" />
-  <text class="label" x="610" y="340">ssh -L DNS forward</text>
-  <text class="small" x="600" y="364">127.0.0.1:15353+</text>
-  <text class="small" x="600" y="382">→ remote NS :53</text>
+  <rect class="card c6" x="300" y="460" width="220" height="90" rx="12"/>
+  <text class="l" x="340" y="500">/etc/resolver/*</text>
+  <text class="s" x="320" y="524">→ 127.0.0.1:53535</text>
 
-  <rect class="card card-os" x="300" y="470" width="230" height="100" rx="14" />
-  <text class="label" x="330" y="510">/etc/resolver/*</text>
-  <text class="small" x="320" y="534">optional macOS stubs</text>
-  <text class="small" x="320" y="552">nameserver 127.0.0.1</text>
+  <rect class="card" x="580" y="460" width="220" height="90" rx="12"/>
+  <text class="l" x="620" y="500">Upstream NS</text>
+  <text class="s" x="600" y="524">corp / 1.1.1.1 / via -L</text>
 
-  <rect class="card" x="580" y="470" width="230" height="100" rx="14" />
-  <text class="label" x="620" y="510">Remote DNS</text>
-  <text class="small" x="600" y="534">corp / public NS</text>
-  <text class="small" x="600" y="552">via Direct or -L</text>
+  <path class="e" d="M236 150 H300"/>
+  <path class="e" d="M500 150 H580"/>
+  <path class="eg" d="M650 210 V300"/>
+  <path class="eg" d="M620 210 C620 250 410 250 410 300"/>
+  <path class="eg" d="M690 210 C720 250 690 270 690 300"/>
+  <path class="eg" d="M520 350 H580"/>
+  <path class="e" d="M146 300 V250 H400 V210"/>
+  <path class="eg" d="M410 400 V460"/>
+  <path class="eg" d="M146 400 C146 520 580 520 580 505"/>
 
-  <path class="edge" d="M216 150 H280" />
-  <text class="edge-label" x="228" y="140">messages</text>
-
-  <path class="edge" d="M490 150 H560" />
-  <text class="edge-label" x="500" y="140">native</text>
-
-  <path class="edge" d="M640 212 V300" />
-  <text class="edge-label" x="650" y="260">spawn -D</text>
-
-  <path class="edge-dns" d="M650 212 C650 250 415 250 415 300" />
-  <text class="edge-label-dns" x="480" y="248">spawn daemon</text>
-
-  <path class="edge-dns" d="M670 212 C720 250 690 270 690 300" />
-  <text class="edge-label-dns" x="700" y="268">spawn -L</text>
-
-  <path class="edge-dns" d="M530 355 H580" />
-  <text class="edge-label-dns" x="535" y="345">via_ssh</text>
-
-  <path class="edge-muted" d="M415 410 V470" />
-  <text class="edge-label" x="425" y="448">opt-in</text>
-
-  <path class="edge-dns" d="M810 355 H900 V520 H810" />
-  <text class="edge-label-dns" x="860" y="430">query</text>
-
-  <path class="edge" d="M146 300 V250 H360 V212" />
-  <text class="edge-label" x="160" y="270">chrome.proxy</text>
-
-  <text class="small" x="36" y="620">DNS plane is independent of proxy mode. SOCKS answers “where traffic exits”; Split DNS answers “how names resolve”.</text>
+  <text class="s" x="36" y="600">Direct + DNS: browser uses system resolver stubs. Global/Routes + DNS: traffic hits gateway so Chrome cannot remote-resolve via SOCKS.</text>
+  <text class="s" x="36" y="624">Matched rule + no answer → NXDOMAIN (no silent fallthrough to VPN corp DNS).</text>
 </svg>

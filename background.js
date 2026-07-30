@@ -13,7 +13,12 @@ const VALID_DNS_KINDS = new Set(["direct", "via_ssh"]);
 const DEFAULT_ROUTES_FALLBACK = "direct";
 const DEFAULT_DNS_LISTEN_PORT = 53535;
 const DEFAULT_DNS_NAMESERVER = "1.1.1.1";
+const DEFAULT_GATEWAY_PORT = 18080;
 const POPUP_PATH = "popup.html";
+
+/** Remember Chrome secure DNS mode so we can restore on DNS Off. */
+let previousSecureDnsMode = null;
+let lastGatewayPort = null;
 const ICONS = {
   connected: {
     16: "icons/connected/icon-16.png",
@@ -307,7 +312,9 @@ function migrateSettings(items) {
         ? defaultNameserverPort
         : 53,
     dnsRules: normalizeDnsRules(items.dnsRules),
-    dnsInstallResolverStubs: Boolean(items.dnsInstallResolverStubs)
+    dnsInstallResolverStubs: Boolean(items.dnsInstallResolverStubs),
+    // Enforce is the product default (scheme D).
+    dnsEnforce: items.dnsEnforce !== false
   };
 }
 
@@ -381,26 +388,11 @@ function tunnelMapFromResponse(response) {
   return map;
 }
 
-function setGlobalProxy(port) {
-  chrome.proxy.settings.set(
-    {
-      scope: "regular",
-      value: {
-        mode: "fixed_servers",
-        rules: {
-          singleProxy: {
-            scheme: "socks5",
-            host: PROXY_HOST,
-            port
-          }
-        }
-      }
-    },
-    () => logProxyResult("set global")
-  );
-}
+function createPacScript(routes, tunnelMap, fallbackPort, options = {}) {
+  const gatewayPort = Number(options.gatewayPort) || 0;
+  const useGateway = Boolean(options.useGateway) && gatewayPort > 0;
+  const globalViaGateway = Boolean(options.globalViaGateway) && useGateway;
 
-function createPacScript(routes, tunnelMap, fallbackPort) {
   const rules = routes
     .map((route) => {
       const parsed =
@@ -420,9 +412,23 @@ function createPacScript(routes, tunnelMap, fallbackPort) {
     .filter((rule) => rule.hostPattern && Number.isInteger(rule.port));
 
   const fallback =
-    Number.isInteger(fallbackPort) && fallbackPort > 0
-      ? `"SOCKS5 ${PROXY_HOST}:${fallbackPort}"`
-      : '"DIRECT"';
+    useGateway && Number.isInteger(fallbackPort) && fallbackPort > 0
+      ? `"PROXY ${PROXY_HOST}:${gatewayPort}"`
+      : Number.isInteger(fallbackPort) && fallbackPort > 0
+        ? `"SOCKS5 ${PROXY_HOST}:${fallbackPort}"`
+        : '"DIRECT"';
+
+  if (globalViaGateway) {
+    return `
+function FindProxyForURL(url, host) {
+  return "PROXY ${PROXY_HOST}:${gatewayPort}";
+}
+`;
+  }
+
+  const matchedReturn = useGateway
+    ? `"PROXY ${PROXY_HOST}:${gatewayPort}"`
+    : `"SOCKS5 ${PROXY_HOST}:" + rule.port`;
 
   return `
 var WEBHOLE_RULES = ${JSON.stringify(rules)};
@@ -492,7 +498,7 @@ function FindProxyForURL(url, host) {
       continue;
     }
 
-    return "SOCKS5 ${PROXY_HOST}:" + rule.port;
+    return ${matchedReturn};
   }
 
   return ${fallback};
@@ -500,27 +506,139 @@ function FindProxyForURL(url, host) {
 `;
 }
 
-function setRoutesProxy(routes, tunnelMap, fallbackPort) {
+function setRoutesProxy(routes, tunnelMap, fallbackPort, options = {}) {
   chrome.proxy.settings.set(
     {
       scope: "regular",
       value: {
         mode: "pac_script",
         pacScript: {
-          data: createPacScript(routes, tunnelMap, fallbackPort)
+          data: createPacScript(routes, tunnelMap, fallbackPort, options)
         }
       }
     },
-    () => logProxyResult("set routes")
+    () => logProxyResult(options.useGateway ? "set routes+gateway" : "set routes")
   );
 }
 
-function applyProxy(mode, settings, tunnelMap) {
+function setGlobalProxy(port, options = {}) {
+  const gatewayPort = Number(options.gatewayPort) || 0;
+
+  if (options.useGateway && gatewayPort > 0) {
+    chrome.proxy.settings.set(
+      {
+        scope: "regular",
+        value: {
+          mode: "pac_script",
+          pacScript: {
+            data: createPacScript([], {}, port, {
+              useGateway: true,
+              gatewayPort,
+              globalViaGateway: true
+            })
+          }
+        }
+      },
+      () => logProxyResult("set global+gateway")
+    );
+    return;
+  }
+
+  chrome.proxy.settings.set(
+    {
+      scope: "regular",
+      value: {
+        mode: "fixed_servers",
+        rules: {
+          singleProxy: {
+            scheme: "socks5",
+            host: PROXY_HOST,
+            port
+          }
+        }
+      }
+    },
+    () => logProxyResult("set global")
+  );
+}
+
+async function ensureGatewayForProxy(mode, settings, tunnelMap) {
+  const enforce =
+    settings.dnsEnforce !== false &&
+    Boolean(settings.dnsEnabled) &&
+    Boolean(settings.sessionDesiredDns);
+  const normalizedMode = normalizeMode(mode);
+
+  if (!enforce || normalizedMode === "direct") {
+    await sendNativeMessage({ action: "gatewayStop" });
+    lastGatewayPort = null;
+    return { useGateway: false, gatewayPort: null };
+  }
+
+  const dnsStatus = await sendNativeMessage({ action: "dnsStatus" });
+
+  if (dnsStatus?.state !== "running" || !dnsStatus.dns?.port) {
+    await sendNativeMessage({ action: "gatewayStop" });
+    lastGatewayPort = null;
+    return { useGateway: false, gatewayPort: null, reason: "dns not running" };
+  }
+
+  const map = tunnelMap || {};
+  const routes = enabledRoutes(settings.routes);
+  const defaultHostAlias = normalizeHostAlias(settings.defaultHostAlias || settings.hostAlias);
+  const routesFallback = normalizeRoutesFallback(settings.routesFallback);
+
+  const gatewayRules = routes
+    .filter((route) => Number.isInteger(map[route.hostAlias]))
+    .map((route) => ({
+      hostPattern: route.hostPattern,
+      pathPrefix: route.pathPrefix || "",
+      socksPort: map[route.hostAlias]
+    }));
+
+  let fallbackSocksPort = 0;
+
+  if (normalizedMode === "global") {
+    fallbackSocksPort = map[defaultHostAlias] || 0;
+  } else if (routesFallback === "default") {
+    fallbackSocksPort = map[defaultHostAlias] || 0;
+  }
+
+  if (normalizedMode === "global" && !fallbackSocksPort) {
+    return { useGateway: false, gatewayPort: null, reason: "no global socks" };
+  }
+
+  if (normalizedMode === "routes" && !gatewayRules.length && !fallbackSocksPort) {
+    return { useGateway: false, gatewayPort: null, reason: "no route socks" };
+  }
+
+  const response = await sendNativeMessage({
+    action: "gatewayStart",
+    listenPort: DEFAULT_GATEWAY_PORT,
+    dnsPort: dnsStatus.dns.port,
+    mode: normalizedMode === "global" ? "global" : "routes",
+    rules: gatewayRules,
+    fallbackSocksPort
+  });
+
+  if (!response?.ok || !response.gateway?.port) {
+    appendLog(`Gateway start failed: ${response?.message || "unknown"}`);
+    lastGatewayPort = null;
+    return { useGateway: false, gatewayPort: null, reason: response?.message || "gateway failed" };
+  }
+
+  lastGatewayPort = response.gateway.port;
+  appendLog(`Gateway ready on ${PROXY_HOST}:${lastGatewayPort}`);
+  return { useGateway: true, gatewayPort: lastGatewayPort };
+}
+
+async function applyProxy(mode, settings, tunnelMap) {
   const normalizedMode = normalizeMode(mode);
   const routes = enabledRoutes(settings.routes);
   const defaultHostAlias = normalizeHostAlias(settings.defaultHostAlias || settings.hostAlias);
   const routesFallback = normalizeRoutesFallback(settings.routesFallback);
   const map = tunnelMap || {};
+  const gatewayInfo = await ensureGatewayForProxy(normalizedMode, settings, map);
 
   if (normalizedMode === "global") {
     const port = map[defaultHostAlias];
@@ -530,7 +648,7 @@ function applyProxy(mode, settings, tunnelMap) {
       return;
     }
 
-    setGlobalProxy(port);
+    setGlobalProxy(port, gatewayInfo);
     return;
   }
 
@@ -551,9 +669,9 @@ function applyProxy(mode, settings, tunnelMap) {
     appendLog(
       `Proxy routes apply: ${rulesWithPort.length}/${routes.length} rules, fallback=${
         fallbackPort ? `default:${fallbackPort}` : "direct"
-      }, hosts=${Object.keys(map).join(",")}`
+      }, gateway=${gatewayInfo.useGateway ? gatewayInfo.gatewayPort : "off"}, hosts=${Object.keys(map).join(",")}`
     );
-    setRoutesProxy(routes, map, fallbackPort);
+    setRoutesProxy(routes, map, fallbackPort, gatewayInfo);
     return;
   }
 
@@ -591,7 +709,8 @@ function getStoredSettings() {
         dnsDefaultNameserver: DEFAULT_DNS_NAMESERVER,
         dnsDefaultNameserverPort: 53,
         dnsRules: [],
-        dnsInstallResolverStubs: false
+        dnsInstallResolverStubs: false,
+        dnsEnforce: true
       },
       (items) => {
         const error = chrome.runtime.lastError;
@@ -618,12 +737,105 @@ function getStoredSettings() {
 }
 
 function buildDnsNativePayload(settings) {
+  const enforce = settings.dnsEnforce !== false;
+
   return {
     listenPort: settings.dnsListenPort || DEFAULT_DNS_LISTEN_PORT,
     defaultNameserver: settings.dnsDefaultNameserver || DEFAULT_DNS_NAMESERVER,
     defaultNameserverPort: settings.dnsDefaultNameserverPort || 53,
-    rules: enabledDnsRules(settings.dnsRules)
+    rules: enabledDnsRules(settings.dnsRules),
+    enforce,
+    autoInstallResolver: enforce
   };
+}
+
+function setSecureDnsMode(mode) {
+  return new Promise((resolve) => {
+    if (!chrome.privacy?.network?.secureDNSMode) {
+      resolve({ ok: false, message: "chrome.privacy.network.secureDNSMode unavailable" });
+      return;
+    }
+
+    chrome.privacy.network.secureDNSMode.set({ value: mode }, () => {
+      const error = chrome.runtime.lastError;
+
+      if (error) {
+        resolve({ ok: false, message: error.message });
+        return;
+      }
+
+      resolve({ ok: true, mode });
+    });
+  });
+}
+
+function getSecureDnsMode() {
+  return new Promise((resolve) => {
+    if (!chrome.privacy?.network?.secureDNSMode) {
+      resolve({ ok: false, levelOfControl: "not_controllable", value: null });
+      return;
+    }
+
+    chrome.privacy.network.secureDNSMode.get({}, (details) => {
+      const error = chrome.runtime.lastError;
+
+      if (error) {
+        resolve({ ok: false, message: error.message, value: null });
+        return;
+      }
+
+      resolve({
+        ok: true,
+        value: details?.value ?? null,
+        levelOfControl: details?.levelOfControl || ""
+      });
+    });
+  });
+}
+
+async function enforceDisableSecureDns() {
+  const current = await getSecureDnsMode();
+
+  if (!current.ok) {
+    return {
+      ok: false,
+      message: current.message || "Cannot read Secure DNS setting",
+      secureDns: current
+    };
+  }
+
+  if (previousSecureDnsMode == null && current.value != null) {
+    previousSecureDnsMode = current.value;
+  }
+
+  if (current.value === "off") {
+    return { ok: true, message: "Secure DNS already off", secureDns: current };
+  }
+
+  const setResult = await setSecureDnsMode("off");
+
+  if (!setResult.ok) {
+    return {
+      ok: false,
+      message: setResult.message || "Failed to disable Secure DNS (DoH)",
+      secureDns: current
+    };
+  }
+
+  appendLog("Secure DNS (DoH) set to off for DNS Enforce");
+  return { ok: true, message: "Secure DNS disabled", secureDns: await getSecureDnsMode() };
+}
+
+async function restoreSecureDnsIfNeeded() {
+  if (previousSecureDnsMode == null || previousSecureDnsMode === "off") {
+    previousSecureDnsMode = null;
+    return { ok: true, message: "No Secure DNS restore needed" };
+  }
+
+  const result = await setSecureDnsMode(previousSecureDnsMode);
+  appendLog(`Secure DNS restored to ${previousSecureDnsMode}: ${result.ok ? "ok" : result.message}`);
+  previousSecureDnsMode = null;
+  return result;
 }
 
 function setDirectMode() {
@@ -653,7 +865,9 @@ const NATIVE_TIMEOUT_MS = {
   dnsStatus: 8000,
   dnsQuery: 15000,
   dnsInstallResolver: 120000,
-  dnsUninstallResolver: 120000
+  dnsUninstallResolver: 120000,
+  gatewayStart: 30000,
+  gatewayStop: 15000
 };
 
 function sendNativeMessage(message) {
@@ -822,7 +1036,7 @@ async function syncTunnelAndProxy() {
 
   if (isTunnelConnected(response) && Object.keys(tunnelMap).length) {
     setActionIcon(true);
-    applyProxy(settings.mode, settings, tunnelMap);
+    await applyProxy(settings.mode, settings, tunnelMap);
     return response;
   }
 
@@ -904,7 +1118,7 @@ async function reconcileSessionFromSettings() {
 
     if (hostsAligned) {
       setActionIcon(true);
-      applyProxy(mode, settings, tunnelMap);
+      await applyProxy(mode, settings, tunnelMap);
       return status;
     }
 
@@ -920,7 +1134,7 @@ async function reconcileSessionFromSettings() {
 
     if (isTunnelConnected(response) && Object.keys(nextMap).length) {
       setActionIcon(true);
-      applyProxy(mode, settings, nextMap);
+      await applyProxy(mode, settings, nextMap);
     } else {
       setActionIcon(false);
       clearProxy();
@@ -1029,7 +1243,7 @@ async function handleTunnelMessage(message) {
           ...nextSettings,
           sessionDesired: true
         });
-        applyProxy(mode, nextSettings, tunnelMap);
+        await applyProxy(mode, nextSettings, tunnelMap);
       } else {
         setActionIcon(false);
       }
@@ -1042,6 +1256,7 @@ async function handleTunnelMessage(message) {
     appendLog("Background disconnect");
 
     return runSuppressed(async () => {
+      await sendNativeMessage({ action: "gatewayStop" });
       const response = await sendNativeMessage({ action: "disconnect" });
 
       setActionIcon(false);
@@ -1082,7 +1297,12 @@ async function reconcileDnsSessionFromSettings() {
 
       if (status?.state === "running") {
         appendLog("Background DNS reconcile: stopping");
-        return sendNativeMessage({ action: "dnsStop" });
+        await sendNativeMessage({ action: "gatewayStop" });
+        const stopped = await sendNativeMessage({ action: "dnsStop" });
+        await restoreSecureDnsIfNeeded();
+        // Re-apply proxy without gateway if tunnels still up.
+        await syncTunnelAndProxy();
+        return stopped;
       }
 
       return status || { ok: true, state: "stopped", dns: null };
@@ -1090,7 +1310,7 @@ async function reconcileDnsSessionFromSettings() {
 
     const payload = buildDnsNativePayload(settings);
     appendLog(
-      `Background DNS reconcile start: port=${payload.listenPort} rules=${payload.rules.length}`
+      `Background DNS reconcile start: port=${payload.listenPort} rules=${payload.rules.length} enforce=${payload.enforce}`
     );
 
     const response = await sendNativeMessage({
@@ -1098,13 +1318,28 @@ async function reconcileDnsSessionFromSettings() {
       ...payload
     });
 
+    let secureDns = { ok: true };
+
+    if (response?.ok && payload.enforce) {
+      secureDns = await enforceDisableSecureDns();
+      if (!secureDns.ok) {
+        appendLog(`DNS Enforce warning: ${secureDns.message}`);
+      }
+    }
+
     if (response?.ok) {
       appendLog(response.message || "DNS started");
+      // Tunnel PAC may need gateway now that DNS is up.
+      await syncTunnelAndProxy();
     } else {
       appendLog(`DNS start failed: ${response?.message || "unknown"}`);
     }
 
-    return response;
+    return {
+      ...response,
+      secureDns,
+      enforce: payload.enforce
+    };
   } finally {
     dnsReconcileInFlight = false;
 
@@ -1170,28 +1405,71 @@ async function handleDnsMessage(message) {
   }
 
   if (message.action === "dnsStart") {
+    const enforce = message.dnsEnforce != null ? Boolean(message.dnsEnforce) : next.dnsEnforce !== false;
+
     await saveSettings({
       dnsEnabled: true,
       sessionDesiredDns: true,
       dnsListenPort: next.dnsListenPort,
       dnsDefaultNameserver: next.dnsDefaultNameserver,
       dnsDefaultNameserverPort: next.dnsDefaultNameserverPort,
-      dnsRules: next.dnsRules
+      dnsRules: next.dnsRules,
+      dnsEnforce: enforce
     });
 
     const payload = buildDnsNativePayload({
       ...next,
-      dnsEnabled: true
+      dnsEnabled: true,
+      dnsEnforce: enforce
     });
 
-    appendLog(`Background DNS On: rules=${payload.rules.length}`);
-    return sendNativeMessage({ action: "dnsStart", ...payload });
+    appendLog(`Background DNS On: rules=${payload.rules.length} enforce=${enforce}`);
+    const response = await sendNativeMessage({ action: "dnsStart", ...payload });
+    let secureDns = { ok: true };
+
+    if (response?.ok && enforce) {
+      secureDns = await enforceDisableSecureDns();
+    }
+
+    if (response?.ok) {
+      await syncTunnelAndProxy();
+    }
+
+    return {
+      ...response,
+      secureDns,
+      enforce,
+      enforceWarnings: [
+        !response?.ok ? response?.message : "",
+        response?.ok && !response?.dns?.resolverInstalled && payload.rules.length
+          ? response?.dns?.resolverMessage || "resolver not installed"
+          : "",
+        secureDns.ok ? "" : secureDns.message
+      ].filter(Boolean)
+    };
   }
 
   if (message.action === "dnsStop") {
     await saveSettings({ sessionDesiredDns: false, dnsEnabled: false });
     appendLog("Background DNS Off");
-    return sendNativeMessage({ action: "dnsStop" });
+    await sendNativeMessage({ action: "gatewayStop" });
+    const response = await sendNativeMessage({ action: "dnsStop" });
+    await restoreSecureDnsIfNeeded();
+    await syncTunnelAndProxy();
+    return response;
+  }
+
+  if (message.action === "dnsEnforceStatus") {
+    const dnsStatus = await sendNativeMessage({ action: "dnsStatus" });
+    const secureDns = await getSecureDnsMode();
+    return {
+      ok: true,
+      enforce: next.dnsEnforce !== false,
+      dns: dnsStatus?.dns || null,
+      dnsState: dnsStatus?.state || "stopped",
+      secureDns,
+      gateway: dnsStatus?.dns?.gateway || null
+    };
   }
 
   if (message.action === "dnsQuery") {
@@ -1342,7 +1620,8 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
     changes.dnsRules ||
     changes.dnsListenPort ||
     changes.dnsDefaultNameserver ||
-    changes.dnsDefaultNameserverPort
+    changes.dnsDefaultNameserverPort ||
+    changes.dnsEnforce
   ) {
     scheduleReconcileDnsSession();
   }

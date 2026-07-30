@@ -796,15 +796,16 @@
           </label>
           <label style="align-content: end;">
             <span style="display:flex;gap:6px;align-items:center;min-height:32px;">
-              <input id="dnsInstallResolverStubs" type="checkbox">
-              macOS /etc/resolver stubs
+              <input id="dnsEnforce" type="checkbox" checked>
+              DNS Enforce（瀏覽器必須走規則）
             </span>
           </label>
         </div>
       </div>
+      <div class="dns-status" id="dnsEnforceStatus" role="status"></div>
 
       <div id="dnsRulesList"></div>
-      <div class="hint">Domain suffix → Direct nameserver 或 Via SSH（<code>ssh -L</code> 到遠端 DNS）。較長 domain 優先。與 Routes 正交。</div>
+      <div class="hint">Domain suffix → nameserver。DNS On 時 Enforce：自動寫 <code>/etc/resolver</code>、關 Chrome DoH；有 tunnel 時走 resolve-then-proxy gateway（禁止 SOCKS 遠端解析）。</div>
 
       <div class="dns-test-row">
         <input id="dnsTestName" type="text" placeholder="name.corp.example.com" spellcheck="false" autocomplete="off">
@@ -819,7 +820,7 @@
       </div>
       <div class="dns-status" id="dnsStatus" role="status"></div>
       <div class="dns-actions">
-        <button class="link-button" id="dnsInstallResolverButton" type="button">Install resolver</button>
+        <button class="link-button" id="dnsInstallResolverButton" type="button">Reinstall resolver</button>
         <button class="link-button" id="dnsUninstallResolverButton" type="button">Uninstall resolver</button>
       </div>
     </section>

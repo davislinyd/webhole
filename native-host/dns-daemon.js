@@ -563,7 +563,9 @@ async function handleQuery(msg, rinfo, config, server) {
     }
   }
 
-  if (rcode === 0 && responseHasAnswers(reply)) {
+  // Do not cache answers for enforce-matched rules: re-applying a negative
+  // nameserver (e.g. 1.1.1.1) must never reuse a prior positive HIT.
+  if (rcode === 0 && responseHasAnswers(reply) && !rule) {
     cacheSet(cacheKey, reply);
   }
 

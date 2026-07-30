@@ -1220,15 +1220,17 @@ async function syncTunnelAndProxy() {
   const response = await sendNativeMessage({ action: "status" });
   const settings = await getStoredSettings();
   const tunnelMap = tunnelMapFromResponse(response);
+  const tunnelsUp = isTunnelConnected(response) && Object.keys(tunnelMap).length > 0;
 
-  if (isTunnelConnected(response) && Object.keys(tunnelMap).length) {
+  if (tunnelsUp) {
     setActionIcon(true);
-    await applyProxy(settings.mode, settings, tunnelMap);
-    return response;
+  } else {
+    setActionIcon(false);
   }
 
-  setActionIcon(false);
-  clearProxy();
+  // Always re-apply proxy/PAC: Direct + DNS Enforce still needs gateway even with no tunnels.
+  // Previously clearProxy() here wiped enforce PAC after every dnsStart/reconcile.
+  await applyProxy(settings.mode, settings, tunnelMap);
   return response;
 }
 

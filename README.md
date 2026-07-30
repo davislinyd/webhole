@@ -46,10 +46,12 @@ v0.4 **三閘**（DNS On 且 Enforce 預設開）：
    # 應失敗
    # 注意：dig / host（不加 @）在 macOS 可能仍顯示 10.x，不要當標準
    ```
-4. Chrome **無痕視窗**開 `https://opscenter.cit.insea.io` → **應失敗**  
-5. 改 nameserver 為 `10.24.11.11` 後 → 應可開  
+4. 狀態列須有 **`gw:18080`**（沒有 gw = PAC 未掛，Chrome 會繞過）  
+5. Chrome **無痕視窗**開 `https://opscenter.cit.insea.io` → **應失敗**  
+6. **取消規則再重新勾選／再套用 1.1.1.1** → 仍應失敗（且 `gateway.log` 有新的 `listening` / `RESOLVE_FAIL`）  
+7. 改 nameserver 為 `10.24.11.11` 後 → 應可開  
 
-若 Chrome 仍開得了：關掉 Secure DNS（`chrome://settings/security`），並清該站快取／用無痕。
+若 Chrome 仍開得了：確認 `gw:` 有顯示；關掉 Secure DNS（`chrome://settings/security`）；用無痕或清該站資料。
 
 ## Architecture (SVG)
 

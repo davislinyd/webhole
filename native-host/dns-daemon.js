@@ -591,15 +591,22 @@ function main() {
   });
 
   server.on("error", (error) => {
-    appendLog(`server error: ${error.message}`);
+    const code = error && error.code ? String(error.code) : "";
+    appendLog(`server error: ${code ? `${code} ` : ""}${error.message}`);
+    // Explicit bind failures (EADDRINUSE) must exit so host.js can surface the log line.
     process.exit(1);
   });
 
-  server.bind(config.listenPort, config.listenHost, () => {
-    appendLog(
-      `listening udp ${config.listenHost}:${config.listenPort} rules=${config.rules.length} default=${config.defaultUpstream.nameserver}:${config.defaultUpstream.nameserverPort}`
-    );
-  });
+  try {
+    server.bind({ port: config.listenPort, address: config.listenHost, exclusive: true }, () => {
+      appendLog(
+        `listening udp ${config.listenHost}:${config.listenPort} rules=${config.rules.length} default=${config.defaultUpstream.nameserver}:${config.defaultUpstream.nameserverPort} enforce=${config.enforce ? 1 : 0} pid=${process.pid}`
+      );
+    });
+  } catch (error) {
+    appendLog(`bind threw: ${error.message}`);
+    process.exit(1);
+  }
 
   process.on("SIGTERM", () => {
     appendLog("SIGTERM");

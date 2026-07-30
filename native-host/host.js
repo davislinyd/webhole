@@ -439,7 +439,11 @@ async function stopTunnelProcess(pid) {
     return;
   }
 
-  process.kill(pid, "SIGTERM");
+  try {
+    process.kill(pid, "SIGTERM");
+  } catch (_error) {
+    return;
+  }
 
   for (let i = 0; i < 20; i += 1) {
     if (!isProcessAlive(pid)) {
@@ -450,7 +454,11 @@ async function stopTunnelProcess(pid) {
   }
 
   if (isProcessAlive(pid)) {
-    process.kill(pid, "SIGKILL");
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch (_error) {
+      // already gone
+    }
   }
 }
 
@@ -1207,10 +1215,73 @@ function writeDnsConfigFile(daemonConfig) {
   fs.writeFileSync(DNS_CONFIG_FILE, JSON.stringify(daemonConfig, null, 2));
 }
 
+function findPidsByCommandSubstring(substr) {
+  return new Promise((resolve) => {
+    execFile("pgrep", ["-f", substr], (error, stdout) => {
+      if (error || !stdout) {
+        resolve([]);
+        return;
+      }
+
+      const pids = String(stdout)
+        .trim()
+        .split(/\s+/)
+        .map((value) => Number(value))
+        .filter((pid) => Number.isInteger(pid) && pid > 0 && pid !== process.pid);
+
+      resolve(pids);
+    });
+  });
+}
+
+function findUdpListenerPids(port) {
+  return new Promise((resolve) => {
+    execFile("lsof", ["-nP", `-iUDP:${port}`, "-t"], (error, stdout) => {
+      if (error || !stdout) {
+        resolve([]);
+        return;
+      }
+
+      const pids = String(stdout)
+        .trim()
+        .split(/\s+/)
+        .map((value) => Number(value))
+        .filter((pid) => Number.isInteger(pid) && pid > 0 && pid !== process.pid);
+
+      resolve([...new Set(pids)]);
+    });
+  });
+}
+
 async function stopDnsDaemonOnly(dnsState) {
+  const pids = new Set();
+
   if (dnsState?.pid) {
-    await stopProcess(dnsState.pid);
-    appendDnsLog(`stopped dns-daemon pid=${dnsState.pid}`);
+    pids.add(Number(dnsState.pid));
+  }
+
+  // Orphans: state.json may be missing after crash/uninstall while daemon still holds the port.
+  for (const pid of await findPidsByCommandSubstring("dns-daemon.js")) {
+    pids.add(pid);
+  }
+
+  if (dnsState?.port) {
+    for (const pid of await findUdpListenerPids(dnsState.port)) {
+      const command = await readProcessCommand(pid);
+
+      if (command.includes("dns-daemon")) {
+        pids.add(pid);
+      }
+    }
+  }
+
+  for (const pid of pids) {
+    if (!Number.isInteger(pid) || pid <= 0) {
+      continue;
+    }
+
+    await stopProcess(pid);
+    appendDnsLog(`stopped dns-daemon pid=${pid}`);
   }
 }
 
@@ -1223,14 +1294,87 @@ async function stopAllDnsForwards(forwards) {
   }
 }
 
+function readLastDnsLogLines(limit = 8) {
+  try {
+    const text = fs.readFileSync(DNS_LOG_FILE, "utf8");
+    const lines = text.trim().split(/\n/).filter(Boolean);
+    return lines.slice(-limit);
+  } catch (_error) {
+    return [];
+  }
+}
+
+function formatDaemonSpawnFailure(listenPort) {
+  const lines = readLastDnsLogLines(12);
+  const bindLine = [...lines].reverse().find((line) => /bind|EADDRINUSE|EACCES|error/i.test(line));
+
+  if (bindLine && /EADDRINUSE/i.test(bindLine)) {
+    return `dns-daemon failed: port ${PROXY_HOST}:${listenPort} already in use (EADDRINUSE). Stop other Webhole DNS processes or change Listen port.`;
+  }
+
+  if (bindLine) {
+    return `dns-daemon exited immediately. Last log: ${bindLine.replace(/^\[[^\]]+\]\s*/, "")}`;
+  }
+
+  return `dns-daemon exited immediately on ${PROXY_HOST}:${listenPort}. See native-host/runtime/dns.log.`;
+}
+
+async function waitForUdpPortFree(port, timeoutMs = 3000) {
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    const holders = await findUdpListenerPids(port);
+
+    if (!holders.length) {
+      return true;
+    }
+
+    // Only treat non-dns-daemon holders as blocking after we tried to kill ours.
+    let foreign = false;
+
+    for (const pid of holders) {
+      const command = await readProcessCommand(pid);
+
+      if (command.includes("dns-daemon")) {
+        await stopProcess(pid);
+        appendDnsLog(`reaped leftover dns-daemon pid=${pid} on :${port}`);
+      } else if (command) {
+        foreign = true;
+        appendDnsLog(`port ${port} held by foreign pid=${pid}: ${command.slice(0, 160)}`);
+      }
+    }
+
+    if (foreign) {
+      return false;
+    }
+
+    await wait(100);
+  }
+
+  return (await findUdpListenerPids(port)).length === 0;
+}
+
 async function spawnDnsDaemon(listenPort) {
   ensureRuntimeDir();
   appendDnsLog(`starting dns-daemon on ${PROXY_HOST}:${listenPort}`);
 
+  // Ensure no orphan holds the UDP port (common after state.json wipe / partial stop).
+  await stopDnsDaemonOnly({ port: listenPort });
+  const free = await waitForUdpPortFree(listenPort, 4000);
+
+  if (!free) {
+    const holders = await findUdpListenerPids(listenPort);
+    return {
+      ok: false,
+      message: `UDP ${PROXY_HOST}:${listenPort} is busy (pids: ${holders.join(",") || "?"}). Change Listen port or free the port.`
+    };
+  }
+
   const child = spawn(process.execPath, [DNS_DAEMON_SCRIPT], {
     detached: true,
     stdio: "ignore",
-    cwd: __dirname
+    cwd: __dirname,
+    env: process.env
   });
 
   child.unref();
@@ -1243,16 +1387,30 @@ async function spawnDnsDaemon(listenPort) {
 
   while (Date.now() < deadline) {
     if (!isProcessAlive(child.pid)) {
-      return { ok: false, message: "dns-daemon exited immediately." };
+      // Allow log flush from child.
+      await wait(80);
+      return { ok: false, message: formatDaemonSpawnFailure(listenPort) };
     }
 
-    // Probe with empty UDP is hard; check process alive after short settle.
-    await wait(150);
+    await wait(120);
 
-    if (isProcessAlive(child.pid)) {
-      // Best-effort: try connecting is wrong for UDP; wait and assume bind ok if alive.
-      await wait(100);
+    // Ready when our pid still lives and something is listening on the UDP port.
+    const holders = await findUdpListenerPids(listenPort);
+
+    if (holders.includes(child.pid) || (isProcessAlive(child.pid) && holders.length > 0)) {
       appendDnsLog(`dns-daemon ready pid=${child.pid} port=${listenPort}`);
+      return {
+        ok: true,
+        pid: child.pid,
+        port: listenPort,
+        startedAt: new Date().toISOString()
+      };
+    }
+
+    // Still starting.
+    if (isProcessAlive(child.pid) && Date.now() + 200 >= deadline) {
+      // Last chance: process alive after settle even if lsof is slow.
+      appendDnsLog(`dns-daemon assumed ready pid=${child.pid} port=${listenPort} (lsof pending)`);
       return {
         ok: true,
         pid: child.pid,
@@ -1262,8 +1420,18 @@ async function spawnDnsDaemon(listenPort) {
     }
   }
 
+  if (isProcessAlive(child.pid)) {
+    appendDnsLog(`dns-daemon ready pid=${child.pid} port=${listenPort}`);
+    return {
+      ok: true,
+      pid: child.pid,
+      port: listenPort,
+      startedAt: new Date().toISOString()
+    };
+  }
+
   await stopProcess(child.pid);
-  return { ok: false, message: "dns-daemon failed to become ready." };
+  return { ok: false, message: formatDaemonSpawnFailure(listenPort) };
 }
 
 async function dnsStart(message) {
@@ -1298,10 +1466,12 @@ async function dnsStart(message) {
   const daemonConfig = buildDaemonConfig(config, forwardsResult.forwards, enforce);
   writeDnsConfigFile(daemonConfig);
 
-  // Restart daemon so it reloads config (simple + reliable for one-shot host).
-  if (existingDns?.pid) {
-    await stopDnsDaemonOnly(existingDns);
-  }
+  // Always tear down orphans + recorded daemon before rebind (state may be missing).
+  await stopDnsDaemonOnly({
+    pid: existingDns?.pid,
+    port: config.listenPort
+  });
+  await wait(150);
 
   const spawned = await spawnDnsDaemon(config.listenPort);
 

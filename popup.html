@@ -823,7 +823,7 @@
       <div class="dns-status" id="dnsEnforceStatus" role="status"></div>
 
       <div id="dnsRulesList"></div>
-      <div class="hint">Domain → nameserver。瀏覽器 Enforce 走 gateway（通常<strong>不必密碼</strong>）。勾「系統 /etc/resolver」才會寫系統 DNS（要授權）。要用 <strong>Touch ID</strong>：先執行 <code>sh scripts/enable-touchid-sudo-macos.sh</code>，再按 Reinstall（會開 Terminal 指紋）。</div>
+      <div class="hint">Domain → nameserver。瀏覽器 Enforce 走 gateway（預設<strong>不必管理員密碼</strong>）。僅在需要 CLI／系統 DNS 時勾「系統 /etc/resolver」，再按 Reinstall（系統密碼對話框）。</div>
 
       <div class="dns-test-row">
         <input id="dnsTestName" type="text" placeholder="name.corp.example.com" spellcheck="false" autocomplete="off">

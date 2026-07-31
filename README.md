@@ -68,24 +68,10 @@ sh scripts/install-native-host-macos.sh chrome-dev
 Chrome → 載入未封裝 extension（專案根目錄）。  
 DNS On / Reinstall resolver 會跳出 **系統管理員授權**（寫 `/etc/resolver`）。
 
-### 密碼 / Touch ID
+### 管理員密碼
 
-Chrome 的 native host **無法可靠地**在系統「管理員密碼」框裡強制出現 Touch ID（這是 macOS 限制）。
-
-**日常建議（瀏覽器 Enforce）：**
-
-- 保持 **「系統 /etc/resolver」關閉**（預設）→ DNS On **不必輸入密碼**（只走 gateway）
-- 只有 CLI / 其它 App 也要 split DNS 時，才勾「系統 /etc/resolver」
-
-**若要系統 resolver + Touch ID：**
-
-```sh
-# 一次設定：讓 sudo 可用指紋
-sh scripts/enable-touchid-sudo-macos.sh
-sudo -v   # 應跳出 Touch ID
-```
-
-然後在 Webhole 勾「系統 /etc/resolver」，按 **Reinstall resolver** → 會開 **Terminal** 用 `sudo`（指紋），而不是 Chrome 的密碼框。
+- **預設**不寫 `/etc/resolver`：瀏覽器 DNS Enforce 只靠 gateway → **日常 DNS On 不必輸入密碼**。
+- 若勾選 **「系統 /etc/resolver」** 並 Reinstall／同步，會出現系統管理員密碼對話框（寫入 `/etc/resolver` 必需）。
 
 ## File roles
 

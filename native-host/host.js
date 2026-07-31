@@ -1548,13 +1548,15 @@ async function dnsStop() {
   const state = readState();
   const dns = state.dns;
 
-  if (dns?.gateway) {
-    await stopGatewayOnly(dns.gateway);
-  }
+  // Always reap gateways even if state.json was lost (orphans break Chrome PAC).
+  await stopAllGateways(dns?.gateway?.port);
 
   if (dns) {
     await stopDnsDaemonOnly(dns);
     await stopAllDnsForwards(dns.forwards);
+  } else {
+    // Still try to kill orphan daemons by command line / port.
+    await stopDnsDaemonOnly({ port: DNS_DEFAULT_PORT });
   }
 
   let resolverMessage = "";
@@ -1672,6 +1674,70 @@ async function stopGatewayOnly(gateway) {
   if (gateway?.pid) {
     await stopProcess(gateway.pid);
     appendDnsLog(`stopped proxy-gateway pid=${gateway.pid}`);
+  }
+}
+
+/** Kill recorded + orphan proxy-gateway processes (state.json may be missing). */
+async function stopAllGateways(preferredPort) {
+  const pids = new Set();
+  const state = readState();
+
+  if (state.dns?.gateway?.pid) {
+    pids.add(Number(state.dns.gateway.pid));
+  }
+
+  for (const pid of await findPidsByCommandSubstring("proxy-gateway.js")) {
+    pids.add(pid);
+  }
+
+  const ports = new Set([GATEWAY_DEFAULT_PORT]);
+
+  if (Number.isInteger(preferredPort) && preferredPort > 0) {
+    ports.add(preferredPort);
+  }
+
+  if (state.dns?.gateway?.port) {
+    ports.add(Number(state.dns.gateway.port));
+  }
+
+  for (const port of ports) {
+    // isPortOpen is TCP connect — good for gateway listen port.
+    if (await isPortOpen(port)) {
+      // lsof TCP listen
+      const tcpPids = await new Promise((resolve) => {
+        execFile("lsof", ["-nP", `-iTCP:${port}`, "-sTCP:LISTEN", "-t"], (error, stdout) => {
+          if (error || !stdout) {
+            resolve([]);
+            return;
+          }
+
+          resolve(
+            String(stdout)
+              .trim()
+              .split(/\s+/)
+              .map((v) => Number(v))
+              .filter((n) => Number.isInteger(n) && n > 0)
+          );
+        });
+      });
+
+      for (const pid of tcpPids) {
+        const command = await readProcessCommand(pid);
+
+        if (command.includes("proxy-gateway") || command.includes("node")) {
+          pids.add(pid);
+        }
+      }
+    }
+  }
+
+  for (const pid of pids) {
+    if (!Number.isInteger(pid) || pid <= 0) {
+      continue;
+    }
+
+    await stopProcess(pid);
+    appendDnsLog(`stopped proxy-gateway (cleanup) pid=${pid}`);
   }
 }
 
@@ -1851,8 +1917,9 @@ async function gatewayStop() {
   const state = readState();
   const dns = state.dns;
 
-  if (dns?.gateway) {
-    await stopGatewayOnly(dns.gateway);
+  await stopAllGateways(dns?.gateway?.port);
+
+  if (dns) {
     writeState({ dns: { ...dns, gateway: null } });
   }
 

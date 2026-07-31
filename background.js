@@ -1487,19 +1487,15 @@ async function reconcileDnsSessionFromSettings() {
     const desired = Boolean(settings.sessionDesiredDns) && Boolean(settings.dnsEnabled);
 
     if (!desired) {
-      const status = await sendNativeMessage({ action: "dnsStatus" });
-
-      if (status?.state === "running") {
-        appendLog("Background DNS reconcile: stopping");
-        await sendNativeMessage({ action: "gatewayStop" });
-        const stopped = await sendNativeMessage({ action: "dnsStop" });
-        await restoreSecureDnsIfNeeded();
-        // Re-apply proxy without gateway if tunnels still up.
-        await syncTunnelAndProxy();
-        return stopped;
-      }
-
-      return status || { ok: true, state: "stopped", dns: null };
+      // Always tear down DNS + gateway + enforce PAC, even if status already looks stopped
+      // (orphans / lost state.json left PAC pointing at dead gateway → sites stay broken).
+      appendLog("Background DNS reconcile: DNS off — full cleanup");
+      await sendNativeMessage({ action: "gatewayStop" });
+      const stopped = await sendNativeMessage({ action: "dnsStop" });
+      await restoreSecureDnsIfNeeded();
+      clearProxy();
+      await syncTunnelAndProxy();
+      return stopped || { ok: true, state: "stopped", dns: null };
     }
 
     const payload = buildDnsNativePayload(settings);
@@ -1649,10 +1645,12 @@ async function handleDnsMessage(message) {
 
   if (message.action === "dnsStop") {
     await saveSettings({ sessionDesiredDns: false, dnsEnabled: false });
-    appendLog("Background DNS Off");
+    appendLog("Background DNS Off — stop gateway, stub, clear proxy");
     await sendNativeMessage({ action: "gatewayStop" });
     const response = await sendNativeMessage({ action: "dnsStop" });
     await restoreSecureDnsIfNeeded();
+    // Must clear enforce PAC immediately (do not leave PROXY 127.0.0.1:18080).
+    clearProxy();
     await syncTunnelAndProxy();
     return response;
   }

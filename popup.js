@@ -1820,9 +1820,8 @@ dnsDefaultNameserverPortInput?.addEventListener("change", () => saveDnsSettings(
 dnsEnforceInput?.addEventListener("change", () => saveDnsSettings());
 dnsSystemResolverInput?.addEventListener("change", () => {
   saveDnsSettings();
-  // Turning on system resolver may prompt admin once (prefer Terminal Touch ID).
   if (dnsSystemResolverInput.checked) {
-    setDnsStatus("已開啟系統 resolver：下次 DNS On / Reinstall 才會寫 /etc/resolver");
+    setDnsStatus("已開啟系統 resolver：下次 DNS On / Reinstall 會要求管理員密碼");
   } else {
     setDnsStatus("已關閉系統 resolver：日常只靠 gateway，通常不需密碼");
   }

@@ -2368,8 +2368,7 @@ async function syncResolverStubs(domains, port, options = {}) {
   lines.push("true");
 
   const result = await runPrivilegedShell(lines.join(" && "), {
-    prompt:
-      "Webhole 需要更新 /etc/resolver（啟用／停用 DNS 規則）。\n請使用 Touch ID 或輸入密碼。"
+    prompt: "Webhole 需要管理員權限以更新 /etc/resolver。"
   });
 
   if (!result.ok) {
